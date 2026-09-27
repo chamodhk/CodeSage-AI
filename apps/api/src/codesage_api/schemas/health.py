@@ -70,6 +70,7 @@ class HealthReportOut(ApiModel):
     grade: Grade
     delta: float  # vs the previous snapshot, both scored under the active profile
     red_issue_count: int  # critical + high, for the health-card summary
+    resolved_finding_count: int = 0
 
     # The active profile's name, shown on the trend chart. Always truthful because
     # there is exactly one active profile per workspace to name; "custom" when the

@@ -11,6 +11,33 @@ down_revision: str | None = "20260925_0018"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+def _replace_foreign_key(table: str, column: str, referred: str, ondelete: str) -> None:
+    """Swap one column's FK action whatever the existing constraint is called.
+
+    Databases built by 0001 use the metadata naming convention, while tables
+    created by later migrations may carry PostgreSQL's default `<t>_<c>_fkey`.
+    """
+    op.execute(
+        f"""
+        DO $$
+        DECLARE existing text;
+        BEGIN
+          SELECT c.conname INTO existing
+          FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+          WHERE c.conrelid = '{table}'::regclass AND c.contype = 'f'
+            AND a.attname = '{column}' AND cardinality(c.conkey) = 1;
+          IF existing IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', '{table}', existing);
+          END IF;
+        END $$;
+        """
+    )
+    op.create_foreign_key(
+        f"fk_{table}_{column}_{referred}", table, referred, [column], ["id"], ondelete=ondelete
+    )
+
+
 RESULT_TABLES = (
     "snapshot", "source_file", "code_symbol", "source_location",
     "static_metric", "process_metric", "finding", "satd_prediction",
@@ -63,21 +90,9 @@ def upgrade() -> None:
         "outcome IN ('success', 'failure', 'denied')",
     )
     op.alter_column("security_audit_record", "workspace_id", nullable=True)
-    op.drop_constraint(
-        "security_audit_record_workspace_id_fkey", "security_audit_record", type_="foreignkey"
-    )
-    op.create_foreign_key(
-        "security_audit_record_workspace_id_fkey", "security_audit_record", "workspace",
-        ["workspace_id"], ["id"], ondelete="SET NULL",
-    )
+    _replace_foreign_key("security_audit_record", "workspace_id", "workspace", "SET NULL")
     op.alter_column("workspace_invitation", "invited_by_user_id", nullable=True)
-    op.drop_constraint(
-        "workspace_invitation_invited_by_user_id_fkey", "workspace_invitation", type_="foreignkey"
-    )
-    op.create_foreign_key(
-        "workspace_invitation_invited_by_user_id_fkey", "workspace_invitation", "app_user",
-        ["invited_by_user_id"], ["id"], ondelete="SET NULL",
-    )
+    _replace_foreign_key("workspace_invitation", "invited_by_user_id", "app_user", "SET NULL")
     op.execute("REVOKE UPDATE, DELETE ON security_audit_record FROM codesage_app")
     op.create_index(
         "ix_analysis_attempt_branch_done_completion",
@@ -91,9 +106,13 @@ def downgrade() -> None:
     op.drop_index("ix_finding_location_severity", table_name="finding")
     op.drop_index("ix_analysis_attempt_branch_done_completion", table_name="analysis_attempt")
     op.execute("GRANT UPDATE, DELETE ON security_audit_record TO codesage_app")
-    op.drop_constraint("security_audit_record_workspace_id_fkey", "security_audit_record", type_="foreignkey")
-    op.create_foreign_key("security_audit_record_workspace_id_fkey", "security_audit_record", "workspace", ["workspace_id"], ["id"], ondelete="RESTRICT")
+    _replace_foreign_key("workspace_invitation", "invited_by_user_id", "app_user", "RESTRICT")
+    op.alter_column("workspace_invitation", "invited_by_user_id", nullable=False)
+    _replace_foreign_key("security_audit_record", "workspace_id", "workspace", "RESTRICT")
     op.alter_column("security_audit_record", "workspace_id", nullable=False)
+    op.execute(
+        "UPDATE security_audit_record SET event_type = event_type || ':' || outcome"
+    )
     op.drop_constraint("security_audit_outcome", "security_audit_record", type_="check")
     op.drop_column("security_audit_record", "workspace_name")
     op.drop_column("security_audit_record", "detail")

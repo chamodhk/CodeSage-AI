@@ -103,6 +103,10 @@ class UpdateWorkspaceIn(ApiModel):
         return _clean(value, field=info.field_name)
 
 
+class DeleteWorkspaceIn(ApiModel):
+    confirmation_name: str = Field(min_length=1, max_length=255)
+
+
 class SwitchWorkspaceIn(ApiModel):
     workspace_id: str
 

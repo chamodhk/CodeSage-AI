@@ -30,6 +30,7 @@ from codesage_api.db.models import (
 from codesage_api.main import create_app
 from codesage_api.services.auth import IdentityClaims, establish_session
 
+from .support import session_cookie
 from .test_rbac_migration import database as database  # noqa: PLC0414 -- pytest fixture
 from .test_rbac_migration import postgres_url as postgres_url  # noqa: PLC0414 -- pytest fixture
 
@@ -72,7 +73,7 @@ def client(onboarding, monkeypatch):
     monkeypatch.setattr("codesage_api.routers.auth.SessionLocal", application_session)
     monkeypatch.setattr("codesage_api.routers.members.SessionLocal", application_session)
     with TestClient(create_app()) as http:
-        http.cookies.set(get_settings().session_cookie_name, str(session_id))
+        http.cookies.set(get_settings().session_cookie_name, session_cookie(engine, session_id))
         yield http
 
 

@@ -7,7 +7,7 @@ import uuid
 from typing import Annotated
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from sqlalchemy.orm import Session as DbSession
@@ -25,14 +25,16 @@ from codesage_api.deps import (
     get_optional_workspace_id,
     require_permission,
 )
-from codesage_api.errors import Forbidden, MisconfiguredSignIn, NotFound, SignInFailed
+from codesage_api.errors import MisconfiguredSignIn, NotFound, SignInFailed
 from codesage_api.schemas.auth import (
     CreateWorkspaceIn,
+    DeleteWorkspaceIn,
     SessionOut,
     SwitchWorkspaceIn,
     UpdateWorkspaceIn,
     WorkspaceSummaryOut,
 )
+from codesage_api.services import audit
 from codesage_api.services import auth as auth_service
 from codesage_api.services.memberships import (
     resolve_authorization_context,
@@ -45,6 +47,24 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 HANDSHAKE_COOKIE = "codesage_signin"
 HANDSHAKE_SECONDS = 600
 WorkspaceAdmin = Annotated[AuthorizationContext, Depends(require_permission("workspace:update"))]
+WorkspaceDeleter = Annotated[AuthorizationContext, Depends(require_permission("workspace:delete"))]
+
+
+def _record_sign_in_failure(reason: str) -> None:
+    db = SessionLocal()
+    try:
+        audit.record(
+            db,
+            event_type="sign_in",
+            outcome="failure",
+            resource_type="session",
+            detail={"reason": reason},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _summary(workspace: auth_service.ActiveWorkspace, *, is_active: bool) -> WorkspaceSummaryOut:
@@ -121,23 +141,36 @@ def complete_sign_in(code: str, state: str, request: Request) -> RedirectRespons
 
     handshake = request.cookies.get(HANDSHAKE_COOKIE)
     if not handshake:
+        _record_sign_in_failure("expired_handshake")
         return _back_to_login("expired")
     try:
         issued = _signer().loads(handshake, max_age=HANDSHAKE_SECONDS)
     except BadSignature:
+        _record_sign_in_failure("invalid_handshake")
         return _back_to_login("invalid")
     if not secrets.compare_digest(issued["state"], state):
+        _record_sign_in_failure("state_mismatch")
         return _back_to_login("invalid")
 
     try:
         claims = auth_service.exchange_code_for_identity(code, issued["verifier"])
     except SignInFailed:
+        _record_sign_in_failure("identity_rejected")
         return _back_to_login("failed")
 
     db = SessionLocal()
     try:
         session = auth_service.establish_session(db, claims)
         session_token = session.raw_token
+        audit.record(
+            db,
+            event_type="sign_in",
+            outcome="success",
+            workspace_id=session.workspace_id,
+            actor_user_id=session.user_id,
+            resource_type="session",
+            resource_id=str(session.id),
+        )
         db.commit()
     except Exception:
         db.rollback()
@@ -247,8 +280,7 @@ def create_workspace(
         if workspace_id is not None:
             set_workspace_context(db, workspace_id)
             context = resolve_authorization_context(db, user_id, workspace_id)
-            if "workspace:update" not in context.permissions:
-                raise Forbidden
+            context.require_permission("workspace:update")
         created = auth_service.create_workspace(
             db,
             session_id=session_id,
@@ -322,6 +354,46 @@ def update_workspace(
     )
 
 
+@router.delete("/workspaces/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_workspace(
+    workspace_id: uuid.UUID,
+    body: DeleteWorkspaceIn,
+    context: WorkspaceDeleter,
+    db: DbSession = Depends(get_db),
+) -> Response:
+    if workspace_id != context.workspace_id:
+        raise NotFound
+    auth_service.delete_workspace(
+        db,
+        workspace_id=workspace_id,
+        actor_user_id=context.user_id,
+        confirmation_name=body.confirmation_name,
+    )
+    # Every session bound to the workspace, this one included, cascades away.
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    _clear_session_cookie(response)
+    return response
+
+
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+def delete_me(
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    session_id: uuid.UUID = Depends(get_current_session_id),
+) -> Response:
+    db = SessionLocal()
+    try:
+        auth_service.anonymize_user(db, session_id=session_id, user_id=user_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    _clear_session_cookie(response)
+    return response
+
+
 @router.put("/workspaces/active", response_model=WorkspaceSummaryOut)
 def switch_workspace(
     body: SwitchWorkspaceIn,
@@ -343,6 +415,17 @@ def switch_workspace(
         )
         if selected is None:
             raise NotFound
+        # Listing the user's workspaces binds each in turn; audit in the new one.
+        set_workspace_context(db, selected.workspace_id)
+        audit.record(
+            db,
+            event_type="workspace_switched",
+            outcome="success",
+            workspace_id=selected.workspace_id,
+            actor_user_id=user_id,
+            resource_type="workspace",
+            resource_id=str(selected.workspace_id),
+        )
         db.commit()
         return _summary(selected, is_active=True)
     except Exception:
@@ -379,7 +462,21 @@ def sign_out(request: Request) -> RedirectResponse:
 
     db = SessionLocal()
     try:
-        auth_service.end_session(db, request.cookies.get(settings.session_cookie_name))
+        ended = auth_service.end_session(
+            db, request.cookies.get(settings.session_cookie_name)
+        )
+        if ended is not None:
+            if ended.workspace_id is not None:
+                set_workspace_context(db, ended.workspace_id)
+            audit.record(
+                db,
+                event_type="sign_out",
+                outcome="success",
+                workspace_id=ended.workspace_id,
+                actor_user_id=ended.user_id,
+                resource_type="session",
+                resource_id=str(ended.id),
+            )
         db.commit()
     except Exception:
         db.rollback()
@@ -388,7 +485,17 @@ def sign_out(request: Request) -> RedirectResponse:
         db.close()
 
     response = RedirectResponse(_idp_logout_url(), status_code=status.HTTP_302_FOUND)
+    _clear_session_cookie(response)
+    return response
 
+
+def _clear_session_cookie(response: Response) -> None:
+    """Delete with the attributes the cookie was set with, domain included.
+
+    A browser matches on name, domain and path; a bare delete would target a
+    different cookie and leave the real one in place.
+    """
+    settings = get_settings()
     response.delete_cookie(
         settings.session_cookie_name,
         path="/",
@@ -397,4 +504,3 @@ def sign_out(request: Request) -> RedirectResponse:
         secure=settings.cookie_secure,
         samesite="lax",
     )
-    return response

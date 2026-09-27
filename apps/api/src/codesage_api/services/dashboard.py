@@ -101,16 +101,22 @@ def calculate_snapshot_score(
     cached.grade = scored.result.grade
     cached.debt_score = sum(item.debt_score for item in scored.result.files)
     cached.kloc = sum(item.loc for item in scored.file_facts.values()) / 1000.0
-    completed = dashboard_repository.list_completed_snapshots(
+    # Traceability compares with the latest DONE snapshot before this one on the
+    # same branch (DBR-15). Find it from lightweight refs and hydrate only it.
+    refs = dashboard_repository.list_completed_snapshot_refs(
         session,
         workspace_id,
         hydrated.analysis_attempt.branch.repository_id,
         hydrated.analysis_attempt.branch.name,
     )
-    current_index = next(
-        (index for index, item in enumerate(completed) if item.id == hydrated.id), -1
+    current_index = next((index for index, item in enumerate(refs) if item.id == hydrated.id), -1)
+    previous = (
+        dashboard_repository.get_snapshot_for_scoring(
+            session, workspace_id, refs[current_index - 1].id
+        )
+        if current_index > 0
+        else None
     )
-    previous = completed[current_index - 1] if current_index > 0 else None
     cached.result_payload = _result_payload(scored, previous)
 
 
@@ -477,6 +483,7 @@ def build_health_report(
         grade=Grade(str(payload["grade"])),
         delta=delta,
         red_issue_count=int(payload["red_issue_count"]),
+        resolved_finding_count=int(payload.get("resolved_finding_count", 0)),
         profile=profile.name,
         model_version=(
             str(payload["model_version"])

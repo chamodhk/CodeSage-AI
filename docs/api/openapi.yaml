@@ -298,6 +298,65 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+    delete:
+      tags: [auth]
+      operationId: delete_workspace
+      summary: Permanently delete the active workspace and all of its data
+      description: |
+        Requires `workspace:delete` (org-admin only). The caller confirms by typing
+        the workspace name exactly. Every repository, snapshot, profile,
+        invitation, membership and session of the workspace is removed in one
+        transaction (DBR-28); signed-in members are signed out.
+
+        Audit records are kept: their workspace link becomes null and the
+        workspace name is retained, with a `workspace_deleted` entry recording who
+        deleted it. Refused while any scan in the workspace is queued or running.
+        Another workspace returns `404`, like every non-active workspace id.
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeleteWorkspaceRequest' }
+      responses:
+        '204': { description: Workspace deleted; the session cookie is cleared. }
+        '401': { $ref: '#/components/responses/NotAuthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `WORKSPACE_CONFIRMATION_MISMATCH` when the typed name differs,
+            `WORKSPACE_SCAN_RUNNING` while a scan is queued or running.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/auth/me:
+    delete:
+      tags: [auth]
+      operationId: delete_account
+      summary: Delete the signed-in user's account
+      description: |
+        Anonymizes the account (DBR-28): email, name, avatar and linked identity
+        fields are cleared, every membership and session is removed, and audit
+        records naming the user now read `deleted-user`. Workspace data the user
+        created stays with the workspace.
+
+        Refused with `LAST_WORKSPACE_ADMIN` while the user is the only active
+        org-admin of any workspace; transfer administration first.
+      responses:
+        '204': { description: Account anonymized; the session cookie is cleared. }
+        '401': { $ref: '#/components/responses/NotAuthenticated' }
+        '409':
+          description: The user is the last org-admin of a workspace.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                detail: Transfer administration before deleting the last administrator account.
+                code: LAST_WORKSPACE_ADMIN
+
   /api/auth/workspaces/active:
     put:
       tags: [auth]
@@ -1494,6 +1553,9 @@ components:
         - PROFILE_IN_USE          # 409
         - PROFILE_NAME_CONFLICT   # 409
         - WORKSPACE_REQUIRED      # 409
+        - WORKSPACE_SCAN_RUNNING  # 409
+        - WORKSPACE_CONFIRMATION_MISMATCH # 409
+        - LAST_WORKSPACE_ADMIN    # 409
         - VALIDATION_FAILED       # 422
         - RATE_LIMITED            # 429
         - UPSTREAM_UNAVAILABLE    # 503
@@ -1727,6 +1789,17 @@ components:
           format: uri
           maxLength: 1000
 
+    DeleteWorkspaceRequest:
+      type: object
+      required: [confirmation_name]
+      additionalProperties: false
+      properties:
+        confirmation_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Must equal the workspace name exactly.
+
     Role:
       type: string
       enum: [org-admin, manager, developer, viewer]
@@ -1950,7 +2023,7 @@ components:
         `priority` is **derived** on this request under the active profile — it is
         included as the sort key the list is already ordered by, so the client never
         re-sorts and the badge can never disagree with the ranking.
-      required: [fingerprint, source, category, severity, file, line, reason, status, priority, pinned_by_floor]
+      required: [fingerprint, source, category, severity, file, line, reason, status, change_status, priority, pinned_by_floor]
       additionalProperties: false
       properties:
         fingerprint:
@@ -1975,6 +2048,15 @@ components:
             hallucinating.
           example: charge() has cyclomatic complexity 18, over the limit of 15 - split it into smaller functions.
         status: { $ref: '#/components/schemas/FindingStatus' }
+        change_status:
+          type: string
+          enum: [new, unchanged]
+          default: new
+          description: |
+            Traceability against the previous completed snapshot of the same
+            branch, by fingerprint (DBR-15). Every finding of a first scan is
+            `new`. Findings that disappeared are counted in the health report's
+            `resolved_finding_count`.
         priority:
           type: number
           description: |
@@ -2106,8 +2188,8 @@ components:
         The client renders; it computes nothing.
       required:
         [snapshot_id, repo_id, branch, commit_sha, scanned_at, health_score, grade,
-         delta, red_issue_count, profile, history, tree, file_scores, findings,
-         category_breakdown]
+         delta, red_issue_count, resolved_finding_count, profile, history, tree,
+         file_scores, findings, category_breakdown]
       additionalProperties: false
       properties:
         snapshot_id: { type: string, format: uuid }
@@ -2129,6 +2211,12 @@ components:
           type: integer
           minimum: 0
           description: Critical + high, for the health-card summary.
+        resolved_finding_count:
+          type: integer
+          minimum: 0
+          description: |
+            Findings present in the previous completed snapshot of this branch
+            and absent from this one, matched by fingerprint (DBR-15).
         profile:
           type: string
           description: |

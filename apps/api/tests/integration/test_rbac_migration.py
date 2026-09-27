@@ -112,8 +112,19 @@ def seed_member(engine, status="active", workspace=None):
     return membership, workspace
 
 
-def assert_policy(engine):
+# Permissions a later revision adds. A database stopped at REVISION predates them.
+LATER_PERMISSIONS = {"workspace:delete"}  # 0020
+
+
+def assert_policy(engine, *, at_head=True):
     policy = json.loads((API_ROOT / "src/codesage_api/authorization/policy.json").read_text())
+    if not at_head:
+        for permission in LATER_PERMISSIONS:
+            policy["permissions"].pop(permission)
+        policy["roles"] = {
+            role: [item for item in grants if item not in LATER_PERMISSIONS]
+            for role, grants in policy["roles"].items()
+        }
     with engine.connect() as db:
         assert set(db.scalars(text('SELECT id FROM "role"'))) == set(policy["roles"])
         assert (
@@ -215,7 +226,7 @@ def test_downgrade_and_reupgrade_preserve_memberships(database):
             == 1
         )
     command.upgrade(config, REVISION)
-    assert_policy(engine)
+    assert_policy(engine, at_head=False)
 
 
 def test_new_workspace_creator_is_admin_using_application_role(database):

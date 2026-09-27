@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from codesage_api.db.models import SecurityAuditRecord
+from codesage_api.db.rls import set_workspace_context
+from codesage_api.errors import PermissionDenied
 
 _SENSITIVE = ("token", "secret", "password", "authorization", "cookie")
 
@@ -29,6 +32,7 @@ def record(
     event_type: str,
     outcome: str,
     workspace_id: uuid.UUID | None = None,
+    workspace_name: str | None = None,
     actor_user_id: uuid.UUID | None = None,
     resource_type: str | None = None,
     resource_id: str | None = None,
@@ -41,11 +45,35 @@ def record(
         resource = f"{resource}:{resource_id}"
     session.add(
         SecurityAuditRecord(
+            # Every column is supplied, so the INSERT needs no RETURNING. A
+            # returned row must also pass the SELECT policy, which a system-scope
+            # (NULL workspace) event deliberately does not: no tenant reads it.
+            timestamp=datetime.now(UTC),
             workspace_id=workspace_id,
+            workspace_name=workspace_name,
             event_type=event_type,
             outcome=outcome,
             actor_identity=actor,
             affected_resource=resource,
             detail=redact(detail) if detail else None,
         )
+    )
+
+
+def record_denial(session: Session, denied: PermissionDenied, *, method: str, path: str) -> None:
+    """Audit a refused operation in its own transaction (DBR-30).
+
+    The request's data transaction is rolled back with the error, so the caller
+    passes a fresh session and commits it.
+    """
+    set_workspace_context(session, denied.workspace_id)
+    record(
+        session,
+        event_type="operation_denied",
+        outcome="denied",
+        workspace_id=denied.workspace_id,
+        actor_user_id=denied.user_id,
+        resource_type="route",
+        resource_id=f"{method} {path}",
+        detail={"permission": denied.permission},
     )

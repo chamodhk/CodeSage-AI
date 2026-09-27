@@ -350,6 +350,7 @@ export interface HealthReport {
   grade: Grade
   delta: number // vs the previous snapshot
   red_issue_count: number // critical/high count for the health-card summary
+  resolved_finding_count: number // findings present previously but absent now
   profile: string // active scoring profile name, labelled on the trend chart
   model_version?: string | null // which ML model produced this; null in degraded mode
   history: HealthPoint[] // trend chart (repo scope)

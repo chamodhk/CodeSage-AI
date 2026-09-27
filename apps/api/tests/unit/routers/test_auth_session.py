@@ -145,3 +145,47 @@ def test_session_is_mounted_on_the_protected_router() -> None:
 
     assert "/auth/session" in paths(auth_router.router)
     assert "/auth/session" not in paths(auth_router.public_router)
+
+
+def test_the_session_cookie_is_the_raw_token_not_the_row_id(monkeypatch) -> None:
+    """DBR-29: the row id is internal; the browser gets an unrelated random token."""
+    from types import SimpleNamespace
+
+    from codesage_api.config import Settings
+
+    settings = Settings(frontend_base_url="https://codesageai.dev", cookie_secure=False)
+    for target in (auth_router, deps, "codesage_api.main", "codesage_api.config"):
+        if isinstance(target, str):
+            monkeypatch.setattr(f"{target}.get_settings", lambda: settings)
+        else:
+            monkeypatch.setattr(target, "get_settings", lambda: settings)
+
+    class _Db:
+        def add(self, _record: object) -> None: ...
+        def commit(self) -> None: ...
+        def rollback(self) -> None: ...
+        def close(self) -> None: ...
+
+    session_id = uuid.uuid4()
+    monkeypatch.setattr(auth_router, "SessionLocal", _Db)
+    monkeypatch.setattr(
+        auth_router.auth_service, "exchange_code_for_identity", lambda _code, _verifier: {}
+    )
+    monkeypatch.setattr(
+        auth_router.auth_service,
+        "establish_session",
+        lambda _db, _claims: SimpleNamespace(
+            id=session_id, user_id=USER_ID, workspace_id=None, raw_token="opaque-raw-token"
+        ),
+    )
+    client = TestClient(create_app(), follow_redirects=False)
+    client.cookies.set(
+        auth_router.HANDSHAKE_COOKIE,
+        auth_router._signer().dumps({"state": "s", "verifier": "v"}),
+    )
+
+    response = client.get("/api/auth/callback?code=c&state=s")
+
+    cookie = response.cookies.get(settings.session_cookie_name)
+    assert cookie == "opaque-raw-token"
+    assert cookie != str(session_id)

@@ -17,19 +17,31 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session as DbSession
 
 from codesage_api.config import get_settings
-from codesage_api.db.enums import MembershipStatus
-from codesage_api.db.models import Membership, Repository, User, UserSession, Workspace
+from codesage_api.db.enums import AnalysisStatus, MembershipStatus
+from codesage_api.db.models import (
+    AnalysisAttempt,
+    Branch,
+    Membership,
+    Repository,
+    User,
+    UserSession,
+    Workspace,
+)
 from codesage_api.db.rls import set_workspace_context
 from codesage_api.errors import (
+    LastWorkspaceAdmin,
     NotAuthenticated,
+    NotFound,
     SignInFailed,
     UpstreamUnavailable,
+    WorkspaceConfirmationMismatch,
+    WorkspaceScanRunning,
 )
-from codesage_api.services import profiles
+from codesage_api.services import audit, profiles
 from codesage_api.services.memberships import get_active_membership
 
 logger = logging.getLogger(__name__)
@@ -348,6 +360,70 @@ def describe_workspace(
     )
 
 
+def delete_workspace(
+    db: DbSession,
+    *,
+    workspace_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    confirmation_name: str,
+) -> None:
+    """Delete one tenant atomically after an exact-name and active-scan check."""
+    workspace = db.scalar(
+        select(Workspace).where(Workspace.id == workspace_id).with_for_update()
+    )
+    if workspace is None:
+        raise NotFound
+    if not secrets.compare_digest(
+        workspace.name.encode("utf-8"), confirmation_name.encode("utf-8")
+    ):
+        raise WorkspaceConfirmationMismatch
+    active = db.scalar(
+        select(AnalysisAttempt.id)
+        .join(Branch, AnalysisAttempt.branch_id == Branch.id)
+        .join(Repository, Branch.repository_id == Repository.id)
+        .where(
+            Repository.workspace_id == workspace_id,
+            AnalysisAttempt.status.in_((AnalysisStatus.QUEUED, AnalysisStatus.RUNNING)),
+        )
+        .limit(1)
+    )
+    if active is not None:
+        raise WorkspaceScanRunning
+    audit.record(
+        db,
+        event_type="workspace_deleted",
+        outcome="success",
+        workspace_id=workspace_id,
+        workspace_name=workspace.name,
+        actor_user_id=actor_user_id,
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+    )
+    db.flush()
+    # A Core DELETE, not `db.delete(workspace)`: the ORM would load each child
+    # collection and try to NULL the audit rows itself, and the application role
+    # may not UPDATE the append-only audit table. The foreign keys do the work:
+    # tenant data cascades, audit rows keep `workspace_name` with a NULL id.
+    db.execute(delete(Workspace).where(Workspace.id == workspace_id))
+    db.expunge(workspace)
+
+
+def anonymize_user(
+    db: DbSession, *, session_id: uuid.UUID, user_id: uuid.UUID
+) -> None:
+    """Remove access and personal fields while retaining shared workspace facts."""
+    changed = db.scalar(select(func.app_anonymize_user(session_id, user_id)))
+    if not changed:
+        raise LastWorkspaceAdmin
+    audit.record(
+        db,
+        event_type="account_deleted",
+        outcome="success",
+        resource_type="app_user",
+        resource_id=str(user_id),
+    )
+
+
 def switch_session_workspace(
     db: DbSession,
     *,
@@ -413,12 +489,16 @@ def load_valid_session(db: DbSession, raw_cookie: str | None) -> UserSession | N
     return session
 
 
-def end_session(db: DbSession, raw_cookie: str | None) -> None:
-    """Delete the row. After this the cookie is a meaningless random string."""
+def end_session(db: DbSession, raw_cookie: str | None) -> UserSession | None:
+    """Delete the row. After this the cookie is a meaningless random string.
+
+    Returns the ended session so the caller can audit whose it was.
+    """
     if not raw_cookie:
-        return
+        return None
     session = db.scalar(
         select(UserSession).where(UserSession.token_hash == _token_hash(raw_cookie))
     )
     if session is not None:
         db.delete(session)
+    return session

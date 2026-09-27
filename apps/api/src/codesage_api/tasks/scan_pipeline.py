@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
@@ -208,6 +209,15 @@ def run_scan(self, attempt_id: str, workspace_id: str) -> None:
                 AnalysisStatus.CANCELLED,
                 None,
             )
+        except SoftTimeLimitExceeded:
+            logger.error("Scan exceeded its time limit")
+            _set_terminal(
+                attempt_uuid,
+                workspace_uuid,
+                AnalysisStatus.ERROR,
+                "The scan took longer than allowed and was stopped.",
+                failure_code="SCAN_TIMED_OUT",
+            )
         except Exception:
             logger.exception("Scan pipeline failed")
             _set_terminal(
@@ -215,6 +225,7 @@ def run_scan(self, attempt_id: str, workspace_id: str) -> None:
                 workspace_uuid,
                 AnalysisStatus.ERROR,
                 "The repository could not be analysed.",
+                failure_code="SCAN_FAILED",
             )
         finally:
             cancel.cleanup(attempt_id, clone_dir)
@@ -406,7 +417,13 @@ def _finalize(
                 session.flush()
                 files_by_path[detected.file_path] = source_file
 
-        for detected in results.findings:
+        # A fingerprint names a finding by what it is, so one rule can match the
+        # same symbol twice. The snapshot enforces one row per fingerprint
+        # (DBR-15); later repeats get the same stable suffix SATD findings use.
+        rule_fingerprints = unique_in_file_order(
+            [(item.fingerprint, item.file_path, item.line) for item in results.findings]
+        )
+        for detected, fingerprint in zip(results.findings, rule_fingerprints, strict=True):
             finding_file = files_by_path.get(detected.file_path)
             if finding_file is None:
                 raise RuntimeError("A finding references an unknown source file.")
@@ -422,6 +439,7 @@ def _finalize(
             session.flush()
             session.add(
                 Finding(
+                    snapshot_id=snapshot.id,
                     source_location=location,
                     category_id=detected.category.value,
                     rule_id=detected.rule_id,
@@ -433,7 +451,7 @@ def _finalize(
                     measured_value=detected.measured_value,
                     threshold=detected.threshold,
                     confidence=None,
-                    fingerprint=detected.fingerprint,
+                    fingerprint=fingerprint,
                     class_name=detected.class_name,
                     method_name=detected.method_name,
                 )
@@ -528,6 +546,7 @@ def _finalize(
             session.flush()
             session.add(
                 Finding(
+                    snapshot_id=snapshot.id,
                     source_location=location,
                     category_id=result.category.value,
                     rule_id=None,
@@ -548,6 +567,7 @@ def _finalize(
         attempt.status = AnalysisStatus.DONE
         attempt.completion_time = datetime.now(UTC)
         attempt.failure_information = None
+        attempt.failure_code = None
         return snapshot.id
 
 
@@ -556,6 +576,8 @@ def _set_terminal(
     workspace_id: uuid.UUID,
     status: AnalysisStatus,
     failure_information: str | None,
+    *,
+    failure_code: str | None = None,
 ) -> None:
     with session_scope() as session:
         set_workspace_context(session, workspace_id)
@@ -565,3 +587,4 @@ def _set_terminal(
         attempt.status = status
         attempt.completion_time = datetime.now(UTC)
         attempt.failure_information = failure_information
+        attempt.failure_code = failure_code

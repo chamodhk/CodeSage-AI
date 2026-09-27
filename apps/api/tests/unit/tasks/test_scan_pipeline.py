@@ -434,6 +434,7 @@ def test_task_records_a_durable_error_when_a_stage_fails(
         workspace_id,
         AnalysisStatus.ERROR,
         "The repository could not be analysed.",
+        failure_code="SCAN_FAILED",
     )
     cleanup.assert_called_once_with(str(attempt_id), str(tmp_path))
 

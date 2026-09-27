@@ -240,6 +240,7 @@ def test_every_sign_in_lands_in_the_app(
     product was an extra step, not a safety measure.
     """
     class _Db:
+        def add(self, _record: object) -> None: ...
         def commit(self) -> None: ...
         def rollback(self) -> None: ...
         def close(self) -> None: ...
@@ -251,7 +252,12 @@ def test_every_sign_in_lands_in_the_app(
     monkeypatch.setattr(
         auth_router.auth_service,
         "establish_session",
-        lambda db, claims: SimpleNamespace(id=uuid.uuid4(), workspace_id=workspace_id),
+        lambda db, claims: SimpleNamespace(
+            id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            workspace_id=workspace_id,
+            raw_token="raw-session-token",
+        ),
     )
 
     response = _callback(client)

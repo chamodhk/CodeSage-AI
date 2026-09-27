@@ -153,7 +153,19 @@ export interface paths {
         get: operations["get_workspace"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Permanently delete the active workspace and all of its data
+         * @description Requires `workspace:delete` (org-admin only). The caller confirms by typing
+         *     the workspace name exactly. Every repository, snapshot, profile,
+         *     invitation, membership and session of the workspace is removed in one
+         *     transaction (DBR-28); signed-in members are signed out.
+         *
+         *     Audit records are kept: their workspace link becomes null and the
+         *     workspace name is retained, with a `workspace_deleted` entry recording who
+         *     deleted it. Refused while any scan in the workspace is queued or running.
+         *     Another workspace returns `404`, like every non-active workspace id.
+         */
+        delete: operations["delete_workspace"];
         options?: never;
         head?: never;
         /**
@@ -163,6 +175,32 @@ export interface paths {
          *     workspace returns `404` even if the caller belongs to it.
          */
         patch: operations["update_workspace"];
+        trace?: never;
+    };
+    "/api/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete the signed-in user's account
+         * @description Anonymizes the account (DBR-28): email, name, avatar and linked identity
+         *     fields are cleared, every membership and session is removed, and audit
+         *     records naming the user now read `deleted-user`. Workspace data the user
+         *     created stays with the workspace.
+         *
+         *     Refused with `LAST_WORKSPACE_ADMIN` while the user is the only active
+         *     org-admin of any workspace; transfer administration first.
+         */
+        delete: operations["delete_account"];
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/auth/workspaces/active": {
@@ -931,7 +969,7 @@ export interface components {
          *     apart from nonsense ones.
          * @enum {string}
          */
-        ErrorCode: "NOT_AUTHENTICATED" | "FORBIDDEN" | "NOT_FOUND" | "CONFLICT" | "INVALID_REPOSITORY_URL" | "REPOSITORY_NOT_PUBLIC" | "REPOSITORY_UNREACHABLE" | "ALREADY_CONNECTED" | "REPOSITORY_SCAN_RUNNING" | "SCAN_ALREADY_RUNNING" | "SCAN_NOT_CANCELLABLE" | "PROFILE_LIMIT_REACHED" | "PROFILE_BUILT_IN" | "PROFILE_IN_USE" | "PROFILE_NAME_CONFLICT" | "WORKSPACE_REQUIRED" | "VALIDATION_FAILED" | "RATE_LIMITED" | "UPSTREAM_UNAVAILABLE" | "SCORE_PENDING" | "INTERNAL_ERROR";
+        ErrorCode: "NOT_AUTHENTICATED" | "FORBIDDEN" | "NOT_FOUND" | "CONFLICT" | "INVALID_REPOSITORY_URL" | "REPOSITORY_NOT_PUBLIC" | "REPOSITORY_UNREACHABLE" | "ALREADY_CONNECTED" | "REPOSITORY_SCAN_RUNNING" | "SCAN_ALREADY_RUNNING" | "SCAN_NOT_CANCELLABLE" | "PROFILE_LIMIT_REACHED" | "PROFILE_BUILT_IN" | "PROFILE_IN_USE" | "PROFILE_NAME_CONFLICT" | "WORKSPACE_REQUIRED" | "WORKSPACE_SCAN_RUNNING" | "WORKSPACE_CONFIRMATION_MISMATCH" | "LAST_WORKSPACE_ADMIN" | "VALIDATION_FAILED" | "RATE_LIMITED" | "UPSTREAM_UNAVAILABLE" | "SCORE_PENDING" | "INTERNAL_ERROR";
         /**
          * @description How bad a finding is. **Assigned once, at detection, and never recomputed**
          *     (FR-8.1): the rule register fixes it for rule findings, the SATD marker
@@ -1126,6 +1164,10 @@ export interface components {
             /** Format: uri */
             website_url?: string | null;
         };
+        DeleteWorkspaceRequest: {
+            /** @description Must equal the workspace name exactly. */
+            confirmation_name: string;
+        };
         /** @enum {string} */
         Role: "org-admin" | "manager" | "developer" | "viewer";
         Member: {
@@ -1319,6 +1361,15 @@ export interface components {
             reason: string;
             status: components["schemas"]["FindingStatus"];
             /**
+             * @description Traceability against the previous completed snapshot of the same
+             *     branch, by fingerprint (DBR-15). Every finding of a first scan is
+             *     `new`. Findings that disappeared are counted in the health report's
+             *     `resolved_finding_count`.
+             * @default new
+             * @enum {string}
+             */
+            change_status: "new" | "unchanged";
+            /**
              * @description `base_points(severity) × category_weight × source_trust × churn_factor ×
              *     risk_factor` (FR-11). Derived, never stored. The list is returned already
              *     sorted by this, descending.
@@ -1446,6 +1497,11 @@ export interface components {
             delta: number;
             /** @description Critical + high, for the health-card summary. */
             red_issue_count: number;
+            /**
+             * @description Findings present in the previous completed snapshot of this branch
+             *     and absent from this one, matched by fingerprint (DBR-15).
+             */
+            resolved_finding_count: number;
             /**
              * @description The active profile's name, shown on the trend chart. Without the label,
              *     the chart changing shape after a profile switch reads as a defect
@@ -1917,6 +1973,45 @@ export interface operations {
             404: components["responses"]["NotFound"];
         };
     };
+    delete_workspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteWorkspaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Workspace deleted; the session cookie is cleared. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["NotAuthenticated"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /**
+             * @description `WORKSPACE_CONFIRMATION_MISMATCH` when the typed name differs,
+             *     `WORKSPACE_SCAN_RUNNING` while a scan is queued or running.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     update_workspace: {
         parameters: {
             query?: never;
@@ -1944,6 +2039,40 @@ export interface operations {
             401: components["responses"]["NotAuthenticated"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+        };
+    };
+    delete_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Account anonymized; the session cookie is cleared. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["NotAuthenticated"];
+            /** @description The user is the last org-admin of a workspace. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "detail": "Transfer administration before deleting the last administrator account.",
+                     *       "code": "LAST_WORKSPACE_ADMIN"
+                     *     }
+                     */
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     switch_active_workspace: {

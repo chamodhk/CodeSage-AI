@@ -12,7 +12,7 @@ from codesage_api.errors import NotFound, ScanAlreadyRunning
 from codesage_api.integrations.github import fetch_branch
 from codesage_api.schemas import ScanStatusOut, ScanSummaryOut
 from codesage_api.scoring.enums import ScanPhase
-from codesage_api.services import dashboard
+from codesage_api.services import audit, dashboard
 from codesage_api.tasks import progress
 
 
@@ -46,7 +46,7 @@ def start(
     repository_id: uuid.UUID,
     branch: str,
     *,
-    actor_user_id: uuid.UUID,
+    actor_user_id: uuid.UUID | None = None,
 ) -> ScanStatusOut:
 
     # Repository removal takes this same row lock. Keep it until the queued
@@ -81,6 +81,17 @@ def start(
         remote_branch.head_commit_sha,
         actor_user_id=actor_user_id,
         workspace_id=workspace_id,
+    )
+
+    audit.record(
+        session,
+        event_type="scan_started",
+        outcome="success",
+        workspace_id=workspace_id,
+        actor_user_id=actor_user_id,
+        resource_type="analysis_attempt",
+        resource_id=str(attempt.id),
+        detail={"repository_id": str(repository_id), "branch": branch},
     )
 
     session.commit()
@@ -156,6 +167,8 @@ def cancel(
     workspace_id: uuid.UUID,
     repository_id: uuid.UUID,
     attempt_id: uuid.UUID,
+    *,
+    actor_user_id: uuid.UUID | None = None,
 ) -> ScanStatusOut:
 
     attempt = attempts.get_for_repository(
@@ -168,4 +181,13 @@ def cancel(
         raise NotFound
     if attempt.status in {AnalysisStatus.QUEUED, AnalysisStatus.RUNNING}:
         progress.request_cancel(str(attempt.id))
+        audit.record(
+            session,
+            event_type="scan_cancelled",
+            outcome="success",
+            workspace_id=workspace_id,
+            actor_user_id=actor_user_id,
+            resource_type="analysis_attempt",
+            resource_id=str(attempt.id),
+        )
     return _status_out(attempt, attempt.branch.name)

@@ -23,6 +23,7 @@ from codesage_api.services.memberships import (
     get_workspace_permissions,
 )
 
+from .support import session_cookie, token_hash
 from .test_rbac_migration import database as database  # noqa: PLC0414 -- pytest fixture
 from .test_rbac_migration import postgres_url as postgres_url  # noqa: PLC0414 -- pytest fixture
 
@@ -81,11 +82,12 @@ def test_nonactive_membership_revokes_existing_session_and_blocks_signin(account
         else:
             membership.status = MembershipStatus(status)
         db.commit()
+    cookie = session_cookie(engine, session_id)
     with Session(engine) as db:
         db.execute(text("SET LOCAL ROLE codesage_app"))
         set_workspace_context(db, workspace_id)
         assert get_workspace_permissions(db, user_id, workspace_id) == frozenset()
-        assert load_valid_session(db, str(session_id)) is None
+        assert load_valid_session(db, cookie) is None
         db.commit()
     with Session(engine) as db:
         assert db.get(UserSession, session_id) is None
@@ -178,6 +180,7 @@ def test_active_membership_in_other_workspace_does_not_validate_session(account)
         db.add(
             UserSession(
                 id=session_id,
+                token_hash=token_hash(str(session_id)),
                 user_id=user_id,
                 workspace_id=workspace_id,
                 created_at=now,
@@ -198,9 +201,10 @@ def test_role_change_applies_to_existing_session(account):
         membership = db.scalar(select(Membership).where(Membership.user_id == user_id))
         membership.role_id = "viewer"
         db.commit()
+    cookie = session_cookie(engine, session_id)
     with Session(engine) as db:
         db.execute(text("SET LOCAL ROLE codesage_app"))
-        assert load_valid_session(db, str(session_id)) is not None
+        assert load_valid_session(db, cookie) is not None
         permissions = get_workspace_permissions(db, user_id, workspace_id)
         assert "project:read" in permissions
         assert "member:manage" not in permissions
@@ -228,7 +232,7 @@ def test_protected_endpoint_rejects_nonactive_membership(account, monkeypatch, s
 
     monkeypatch.setattr(deps, "SessionLocal", application_session)
     with TestClient(create_app()) as client:
-        client.cookies.set(get_settings().session_cookie_name, str(session_id))
+        client.cookies.set(get_settings().session_cookie_name, session_cookie(engine, session_id))
         response = client.get("/api/auth/session")
     assert response.status_code == 401
     with Session(engine) as db:
