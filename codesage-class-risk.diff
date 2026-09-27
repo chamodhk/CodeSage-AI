@@ -1,0 +1,1088 @@
+diff --git a/apps/api/alembic/versions/20260812_0001_complete_erd.py b/apps/api/alembic/versions/20260812_0001_complete_erd.py
+index 65acb631..b492aba1 100644
+--- a/apps/api/alembic/versions/20260812_0001_complete_erd.py
++++ b/apps/api/alembic/versions/20260812_0001_complete_erd.py
+@@ -4,8 +4,8 @@ Revision ID: 20260812_0001
+ Revises:
+ """
+ 
+-from collections.abc import Sequence
+ import uuid
++from collections.abc import Sequence
+ 
+ from alembic import op
+ from sqlalchemy import (
+@@ -16,13 +16,12 @@ from sqlalchemy import (
+     MetaData,
+     Table,
+     UniqueConstraint,
+-    insert,
+     text,
+ )
+ from sqlalchemy.schema import CreateIndex, CreateTable, DropTable
+ 
+-from codesage_api.db.base import Base
+ import codesage_api.db.models  # noqa: F401
++from codesage_api.db.base import Base
+ 
+ revision: str = "20260812_0001"
+ down_revision: str | None = None
+@@ -69,6 +68,7 @@ LATER_TABLES = {
+     "workspace_invitation",  # 0013
+     "workspace_profile_settings",  # 0015
+     "repository_profile_assignment",  # 0015
++    "class_risk_prediction",  # 0017
+ }
+ 
+ # Columns introduced after 0001.
+@@ -77,6 +77,7 @@ LATER_COLUMNS = {
+     "membership": ("role_id",),  # 0010
+     "app_user": ("email_verified",),  # 0013
+     "analysis_attempt": ("initiated_by_user_id", "initiating_workspace_id"),  # 0011
++    "finding": ("class_name", "method_name"),  # 0017
+     "scoring_profile": (  # 0015
+         "kind",
+         "preset_key",
+diff --git a/apps/api/src/codesage_api/db/models/__init__.py b/apps/api/src/codesage_api/db/models/__init__.py
+index 31191d90..61d677ec 100644
+--- a/apps/api/src/codesage_api/db/models/__init__.py
++++ b/apps/api/src/codesage_api/db/models/__init__.py
+@@ -9,7 +9,8 @@ Grouped to match the four domains of SAD §9 Data View:
+     source.py      — SourceFile, FileTreeNode, CodeSymbol, SourceLocation,
+                      StaticMetric, ProcessMetric
+     finding.py     — Finding, DebtCategory
+-    ml.py          — SATDPrediction, BugRiskPrediction, MLModelVersion
++    ml.py          — SATDPrediction, BugRiskPrediction, ClassRiskPrediction,
++                     MLModelVersion
+     provenance.py  — AnalysisEngineVersion, AnalysisEngineModelVersion
+     rules.py       — RuleDefinition, SATDMarkerPattern
+     profile.py     — ScoringProfile, ScoringPreset, WorkspaceProfileSettings,
+@@ -26,10 +27,15 @@ only, FR-6). The v2 RBAC catalogue is now stored for DBR-5; API enforcement
+ is a separate implementation step.
+ """
+ 
+-from codesage_api.db.models.authorization import Permission, Role, RolePermission
+ from codesage_api.db.models.analysis import AnalysisAttempt, Snapshot
++from codesage_api.db.models.authorization import Permission, Role, RolePermission
+ from codesage_api.db.models.finding import DebtCategory, Finding
+-from codesage_api.db.models.ml import BugRiskPrediction, MLModelVersion, SATDPrediction
++from codesage_api.db.models.ml import (
++    BugRiskPrediction,
++    ClassRiskPrediction,
++    MLModelVersion,
++    SATDPrediction,
++)
+ from codesage_api.db.models.profile import (
+     RepositoryProfileAssignment,
+     ScoringPreset,
+@@ -63,6 +69,7 @@ __all__ = [
+     "AnalysisEngineVersion",
+     "Branch",
+     "BugRiskPrediction",
++    "ClassRiskPrediction",
+     "CodeSymbol",
+     "DebtCategory",
+     "FileTreeNode",
+@@ -70,11 +77,11 @@ __all__ = [
+     "MLModelVersion",
+     "Membership",
+     "Permission",
+-    "Role",
+-    "RolePermission",
+     "ProcessMetric",
+     "Repository",
+     "RepositoryProfileAssignment",
++    "Role",
++    "RolePermission",
+     "RuleDefinition",
+     "SATDMarkerPattern",
+     "SATDPrediction",
+diff --git a/apps/api/src/codesage_api/db/models/finding.py b/apps/api/src/codesage_api/db/models/finding.py
+index 042a6e95..1f345068 100644
+--- a/apps/api/src/codesage_api/db/models/finding.py
++++ b/apps/api/src/codesage_api/db/models/finding.py
+@@ -15,7 +15,7 @@ if TYPE_CHECKING:
+     from codesage_api.db.models.source import SourceLocation
+ 
+ 
+-def values(enum: type[FindingSource] | type[Severity]) -> list[str]:
++def values(enum: type[FindingSource | Severity]) -> list[str]:
+     return [item.value for item in enum]
+ 
+ 
+@@ -42,6 +42,8 @@ class Finding(UUIDPrimaryKey, Base):
+     threshold: Mapped[float | None] = mapped_column(Double)
+     confidence: Mapped[float | None] = mapped_column(Double)
+     fingerprint: Mapped[str] = mapped_column(String(128), index=True)
++    class_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
++    method_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+     source_location: Mapped[SourceLocation] = relationship(back_populates="findings")
+     category: Mapped[DebtCategory] = relationship(back_populates="findings")
+     rule_definition: Mapped[RuleDefinition | None] = relationship(back_populates="findings")
+diff --git a/apps/api/src/codesage_api/db/models/ml.py b/apps/api/src/codesage_api/db/models/ml.py
+index 4ab9efa9..e6892984 100644
+--- a/apps/api/src/codesage_api/db/models/ml.py
++++ b/apps/api/src/codesage_api/db/models/ml.py
+@@ -42,6 +42,9 @@ class MLModelVersion(UUIDPrimaryKey, Base):
+     evaluation_metrics: Mapped[dict[str, object]] = mapped_column(MutableDict.as_mutable(JSONB))
+     satd_predictions: Mapped[list[SATDPrediction]] = relationship(back_populates="model_version")
+     bug_risk_predictions: Mapped[list[BugRiskPrediction]] = relationship(back_populates="model_version")
++    class_risk_predictions: Mapped[list[ClassRiskPrediction]] = relationship(
++        back_populates="model_version"
++    )
+     engine_version_links: Mapped[list[AnalysisEngineModelVersion]] = relationship(back_populates="model_version")
+     __table_args__ = (UniqueConstraint("model_type", "version_identifier"),)
+ 
+@@ -77,3 +80,33 @@ class BugRiskPrediction(UUIDPrimaryKey, Base):
+         CheckConstraint("risk_score >= 0 AND risk_score <= 1", name="risk_score_probability"),
+         CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_probability"),
+     )
++
++
++class ClassRiskPrediction(UUIDPrimaryKey, Base):
++    __tablename__ = "class_risk_prediction"
++    source_file_id: Mapped[uuid.UUID] = mapped_column(
++        ForeignKey("source_file.id", ondelete="CASCADE"), index=True
++    )
++    model_version_id: Mapped[uuid.UUID] = mapped_column(
++        ForeignKey("ml_model_version.id", ondelete="RESTRICT"), index=True
++    )
++    class_name: Mapped[str] = mapped_column(String(500), index=True)
++    risk_score: Mapped[float] = mapped_column(Double)
++    confidence: Mapped[float | None] = mapped_column(Double, nullable=True)
++    source_file: Mapped[SourceFile] = relationship(
++        back_populates="class_risk_predictions"
++    )
++    model_version: Mapped[MLModelVersion] = relationship(
++        back_populates="class_risk_predictions"
++    )
++    __table_args__ = (
++        UniqueConstraint("source_file_id", "model_version_id", "class_name"),
++        CheckConstraint(
++            "risk_score >= 0 AND risk_score <= 1",
++            name="class_risk_score_probability",
++        ),
++        CheckConstraint(
++            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
++            name="class_risk_confidence_probability",
++        ),
++    )
+diff --git a/apps/api/src/codesage_api/db/models/source.py b/apps/api/src/codesage_api/db/models/source.py
+index 1e18ce24..939e9ca4 100644
+--- a/apps/api/src/codesage_api/db/models/source.py
++++ b/apps/api/src/codesage_api/db/models/source.py
+@@ -20,7 +20,11 @@ from codesage_api.db.enums import CodeSymbolType, FileTreeNodeType
+ if TYPE_CHECKING:
+     from codesage_api.db.models.analysis import Snapshot
+     from codesage_api.db.models.finding import Finding
+-    from codesage_api.db.models.ml import BugRiskPrediction, SATDPrediction
++    from codesage_api.db.models.ml import (
++        BugRiskPrediction,
++        ClassRiskPrediction,
++        SATDPrediction,
++    )
+ 
+ 
+ def values(enum: type[CodeSymbolType | FileTreeNodeType]) -> list[str]:
+@@ -38,6 +42,9 @@ class SourceFile(UUIDPrimaryKey, Base):
+     static_metrics: Mapped[list[StaticMetric]] = relationship(back_populates="source_file", passive_deletes=True)
+     process_metric: Mapped[ProcessMetric | None] = relationship(back_populates="source_file", uselist=False, passive_deletes=True)
+     bug_risk_predictions: Mapped[list[BugRiskPrediction]] = relationship(back_populates="source_file", passive_deletes=True)
++    class_risk_predictions: Mapped[list[ClassRiskPrediction]] = relationship(
++        back_populates="source_file", passive_deletes=True
++    )
+     file_tree_nodes: Mapped[list[FileTreeNode]] = relationship(back_populates="source_file")
+     __table_args__ = (UniqueConstraint("snapshot_id", "relative_path"),)
+ 
+diff --git a/apps/api/src/codesage_api/db/repositories/dashboard.py b/apps/api/src/codesage_api/db/repositories/dashboard.py
+index 78b92d57..81183ef4 100644
+--- a/apps/api/src/codesage_api/db/repositories/dashboard.py
++++ b/apps/api/src/codesage_api/db/repositories/dashboard.py
+@@ -12,6 +12,7 @@ from codesage_api.db.models import (
+     AnalysisAttempt,
+     Branch,
+     BugRiskPrediction,
++    ClassRiskPrediction,
+     Finding,
+     Repository,
+     SATDPrediction,
+@@ -30,6 +31,9 @@ def _scoring_options():
+         .selectinload(SourceFile.bug_risk_predictions)
+         .joinedload(BugRiskPrediction.model_version),
+         selectinload(Snapshot.source_files)
++        .selectinload(SourceFile.class_risk_predictions)
++        .joinedload(ClassRiskPrediction.model_version),
++        selectinload(Snapshot.source_files)
+         .selectinload(SourceFile.source_locations)
+         .joinedload(SourceLocation.code_symbol),
+         selectinload(Snapshot.source_files)
+diff --git a/apps/api/src/codesage_api/detection/risk/client.py b/apps/api/src/codesage_api/detection/risk/client.py
+index 82c1b7ba..6fc4fa01 100644
+--- a/apps/api/src/codesage_api/detection/risk/client.py
++++ b/apps/api/src/codesage_api/detection/risk/client.py
+@@ -1,10 +1,10 @@
+-"""ML-2 client: class-level metrics in, per-file bug-risk score out.
++"""ML-2 client: class-level metrics in, class and file risk scores out.
+ 
+ The ML model predicts bug-proneness for individual Java classes using
+ class-specific CK metrics and file-level process metrics.
+ 
+-Class probabilities are aggregated into one file-level probability before
+-being returned to the scan pipeline.
++Class probabilities are preserved and also aggregated into one file-level
++probability.
+ """
+ 
+ from __future__ import annotations
+@@ -23,8 +23,12 @@ from codesage_api.extractors.process_metrics import FileProcessMetrics
+ 
+ @dataclass(frozen=True, slots=True)
+ class RiskClientResult:
+-    # Final file-level probabilities consumed by the scan/scoring pipeline.
+-    scores: dict[str, float]
++    # Canonical ML-2 predictions:
++    # (source file path, class name) -> class bug-proneness probability
++    class_scores: dict[tuple[str, str], float]
++
++    # Derived aggregate retained for file-level scoring/dashboard use.
++    file_scores: dict[str, float]
+ 
+     model_version: str
+ 
+@@ -177,14 +181,16 @@ def predict(
+     process: dict[str, FileProcessMetrics],
+ ) -> RiskClientResult:
+     """
+-    Batch-predict class-level bug-proneness and return per-file risk.
++    Batch-predict class-level bug-proneness and return class and file risk.
+ 
+     Each ML observation represents one Java class.
+ 
+     File-level process metrics are joined to each class using the class's
+-    source-file path. The returned class probabilities are then aggregated
+-    into one probability per file.
++    source-file path. Class probabilities are preserved as the canonical
++    ML predictions and also aggregated into one probability per file.
+     """
++
++
+     eligible_classes = [
+         metrics
+         for metrics in classes
+@@ -193,10 +199,10 @@ def predict(
+ 
+     if not eligible_classes:
+         return RiskClientResult(
+-            scores={},
++            class_scores={},
++            file_scores={},
+             model_version="",
+         )
+-
+     settings = get_settings()
+     url = f"{settings.ml_service_url.rstrip('/')}/risk"
+ 
+@@ -269,10 +275,8 @@ def predict(
+ 
+         received_classes: set[tuple[str, str]] = set()
+ 
+-        class_scores_by_file: dict[
+-            str,
+-            list[float],
+-        ] = defaultdict(list)
++        class_scores: dict[tuple[str, str], float] = {}
++        class_scores_by_file: dict[str, list[float]] = defaultdict(list)
+ 
+         for item in raw_scores:
+             path = str(item["path"])
+@@ -305,6 +309,8 @@ def predict(
+ 
+             received_classes.add(identity)
+ 
++            class_scores[identity] = score
++
+             class_scores_by_file[path].append(
+                 score
+             )
+@@ -330,7 +336,8 @@ def predict(
+         )
+ 
+         return RiskClientResult(
+-            scores=file_scores,
++            class_scores=class_scores,
++            file_scores=file_scores,
+             model_version=model_version.strip(),
+         )
+ 
+@@ -341,4 +348,4 @@ def predict(
+         raise MLServiceUnavailable(
+             "Failed to communicate with ML risk service: "
+             f"{exc}"
+-        ) from exc
+\ No newline at end of file
++        ) from exc
+diff --git a/apps/api/src/codesage_api/detection/rules/engine.py b/apps/api/src/codesage_api/detection/rules/engine.py
+index 8912f8e9..3e3d93f4 100644
+--- a/apps/api/src/codesage_api/detection/rules/engine.py
++++ b/apps/api/src/codesage_api/detection/rules/engine.py
+@@ -29,6 +29,10 @@ class DetectedFinding:
+     threshold: float | None
+     fingerprint: str
+ 
++    # Structural context used by downstream risk resolution.
++    class_name: str | None = None
++    method_name: str | None = None
++
+ 
+ _FILE_RULE_ACCESSORS: dict[str, Callable[[FileMetrics], float]] = {
+     "large-file": lambda item: float(item.loc),
+@@ -116,7 +120,13 @@ def _method_metric_findings(
+                     evidence=f"{rule.rule_id}={value:g}",
+                     measured_value=value,
+                     threshold=threshold,
+-                    fingerprint=rule_fingerprint(rule.rule_id, item.path, symbol),
++                    fingerprint=rule_fingerprint(
++                        rule.rule_id,
++                        item.path,
++                        symbol,
++                    ),
++                    class_name=item.class_name,
++                    method_name=item.method_name,
+                 )
+             )
+     return findings
+diff --git a/apps/api/src/codesage_api/scoring/formula.py b/apps/api/src/codesage_api/scoring/formula.py
+index 6eaa9562..71ce25c2 100644
+--- a/apps/api/src/codesage_api/scoring/formula.py
++++ b/apps/api/src/codesage_api/scoring/formula.py
+@@ -17,9 +17,9 @@ def churn_factor(facts: FileFacts) -> float:
+     return 1.0 + min(facts.commits_90d, cap) / cap
+ 
+ 
+-def risk_factor(facts: FileFacts, profile: Profile) -> float:
++def risk_factor(risk_score: float, profile: Profile) -> float:
+   
+-    return 1.0 + ml_trust(profile) * facts.risk_score
++    return 1.0 + ml_trust(profile) * risk_score
+ 
+ 
+ def rule_trust(profile: Profile) -> float:
+@@ -46,7 +46,7 @@ def finding_priority(finding: ScoringFinding, facts: FileFacts, profile: Profile
+         * profile.weights[finding.category]
+         * source_trust(finding, profile)
+         * churn_factor(facts)
+-        * risk_factor(facts, profile)
++        * risk_factor(finding.risk_score, profile)
+     )
+ 
+ 
+diff --git a/apps/api/src/codesage_api/scoring/models.py b/apps/api/src/codesage_api/scoring/models.py
+index 820359bf..36064bc1 100644
+--- a/apps/api/src/codesage_api/scoring/models.py
++++ b/apps/api/src/codesage_api/scoring/models.py
+@@ -9,13 +9,12 @@ from codesage_api.scoring.enums import Category, Severity, Source
+ 
+ @dataclass(frozen=True, slots=True)
+ class ScoringFinding:
+-
+-
+     fingerprint: str
+     source: Source
+     category: Category
+     severity: Severity
+     file: str
++    risk_score: float
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+diff --git a/apps/api/src/codesage_api/services/dashboard.py b/apps/api/src/codesage_api/services/dashboard.py
+index b9821cc8..1ff13907 100644
+--- a/apps/api/src/codesage_api/services/dashboard.py
++++ b/apps/api/src/codesage_api/services/dashboard.py
+@@ -148,15 +148,18 @@ def _score_snapshot(snapshot: Snapshot, profile: Profile) -> _ScoredSnapshot:
+     findings_by_fingerprint: dict[str, Finding] = {}
+ 
+     for source_file in snapshot.source_files:
+-        risk_score = (
++        file_risk = (
+             source_file.bug_risk_predictions[0].risk_score
+             if source_file.bug_risk_predictions
+             else 0.0
+         )
+-        process = source_file.process_metric
++        class_risks = {
++            prediction.class_name: prediction.risk_score
++            for prediction in source_file.class_risk_predictions
++        }
+         file_facts[source_file.relative_path] = FileFacts(
+             file=source_file.relative_path,
+-            risk_score=risk_score,
++            risk_score=file_risk,
+             # The process extractor now measures cumulative versions, not a
+             # rolling 90-day commit count. Do not substitute one for the other.
+             commits_90d=0,
+@@ -164,6 +167,11 @@ def _score_snapshot(snapshot: Snapshot, profile: Profile) -> _ScoredSnapshot:
+         )
+         for location in source_file.source_locations:
+             for stored in location.findings:
++                finding_risk = (
++                    class_risks.get(stored.class_name)
++                    if stored.class_name is not None
++                    else None
++                )
+                 scoring_findings.append(
+                     ScoringFinding(
+                         fingerprint=stored.fingerprint,
+@@ -171,6 +179,11 @@ def _score_snapshot(snapshot: Snapshot, profile: Profile) -> _ScoredSnapshot:
+                         category=Category(stored.category_id),
+                         severity=Severity(stored.severity.value),
+                         file=source_file.relative_path,
++                        risk_score=(
++                            finding_risk
++                            if finding_risk is not None
++                            else file_risk
++                        ),
+                     )
+                 )
+                 findings_by_fingerprint.setdefault(stored.fingerprint, stored)
+diff --git a/apps/api/src/codesage_api/tasks/scan_pipeline.py b/apps/api/src/codesage_api/tasks/scan_pipeline.py
+index 6acd029d..c57a85da 100644
+--- a/apps/api/src/codesage_api/tasks/scan_pipeline.py
++++ b/apps/api/src/codesage_api/tasks/scan_pipeline.py
+@@ -31,6 +31,7 @@ from codesage_api.db.enums import (
+ from codesage_api.db.models import (
+     AnalysisEngineModelVersion,
+     BugRiskPrediction,
++    ClassRiskPrediction,
+     Finding,
+     MLModelVersion,
+     ProcessMetric,
+@@ -228,7 +229,14 @@ def _finalize(
+         # same conflict-safe pattern as ML-1: concurrent scans may observe a new
+         # model version at the same time.
+         model_version_record: MLModelVersion | None = None
+-        if results.risk_result and results.risk_result.scores and results.risk_result.model_version:
++        if (
++            results.risk_result
++            and (
++                results.risk_result.class_scores
++                or results.risk_result.file_scores
++            )
++            and results.risk_result.model_version
++        ):
+             v_name = results.risk_result.model_version
+             session.execute(
+                 insert(MLModelVersion)
+@@ -328,9 +336,10 @@ def _finalize(
+             if (
+                 results.risk_result
+                 and model_version_record
+-                and metrics.path in results.risk_result.scores
++                and metrics.path in results.risk_result.file_scores
+             ):
+-                score = results.risk_result.scores[metrics.path]
++                score = results.risk_result.file_scores[metrics.path]
++
+                 session.add(
+                     BugRiskPrediction(
+                         source_file=source_file,
+@@ -342,6 +351,26 @@ def _finalize(
+                     )
+                 )
+ 
++        if results.risk_result and model_version_record:
++            for (file_path, class_name), score in sorted(
++                results.risk_result.class_scores.items()
++            ):
++                predicted_source_file = files_by_path.get(file_path)
++                if predicted_source_file is None:
++                    raise RuntimeError(
++                        "A class risk prediction references "
++                        f"an unknown source file: {file_path}"
++                    )
++                session.add(
++                    ClassRiskPrediction(
++                        source_file=predicted_source_file,
++                        model_version=model_version_record,
++                        class_name=class_name,
++                        risk_score=score,
++                        confidence=None,
++                    )
++                )
++
+         # Comment extraction intentionally scans every Java source file, while
+         # CK may omit files it cannot analyse. Preserve valid SATD predictions
+         # for those files by creating the source-file fact without inventing
+@@ -386,6 +415,8 @@ def _finalize(
+                     threshold=detected.threshold,
+                     confidence=None,
+                     fingerprint=detected.fingerprint,
++                    class_name=detected.class_name,
++                    method_name=detected.method_name,
+                 )
+             )
+ 
+@@ -478,6 +509,8 @@ def _finalize(
+                     threshold=None,
+                     confidence=result.confidence,
+                     fingerprint=satd_fingerprint(result.comment.file_path, result.comment.text),
++                    class_name=None,
++                    method_name=None,
+                 )
+             )
+ 
+diff --git a/apps/api/tests/unit/db/test_models.py b/apps/api/tests/unit/db/test_models.py
+index 7ff3c83f..579ca277 100644
+--- a/apps/api/tests/unit/db/test_models.py
++++ b/apps/api/tests/unit/db/test_models.py
+@@ -10,7 +10,8 @@ EXPECTED_TABLES = {
+     "analysis_engine_version",
+     "app_user",
+     "branch",
+-    "bug_risk_prediction",
++    "bug_risk_prediction",
++    "class_risk_prediction",
+     "code_symbol",
+     "debt_category",
+     "file_tree_node",
+@@ -97,7 +98,11 @@ def test_probability_and_range_checks_exist() -> None:
+         "analysis_attempt": {"ck_analysis_attempt_retry_count_nonnegative"},
+         "snapshot": {"ck_snapshot_finding_count_nonnegative"},
+         "satd_prediction": {"ck_satd_prediction_confidence_probability"},
+-        "bug_risk_prediction": {"ck_bug_risk_prediction_risk_score_probability"},
++        "bug_risk_prediction": {"ck_bug_risk_prediction_risk_score_probability"},
++        "class_risk_prediction": {
++            "ck_class_risk_prediction_class_risk_score_probability",
++            "ck_class_risk_prediction_class_risk_confidence_probability",
++        },
+     }
+     for table_name, names in expected.items():
+         actual = {
+@@ -121,10 +126,28 @@ def test_profile_dependent_scores_are_not_persisted() -> None:
+         assert actual.isdisjoint(forbidden)
+ 
+ 
+-def test_bug_risk_confidence_can_be_unknown() -> None:
++def test_bug_risk_confidence_can_be_unknown() -> None:
+     """Risk probability must not be duplicated as a fake confidence value."""
+     table = Base.metadata.tables["bug_risk_prediction"]
+-    assert table.columns["confidence"].nullable is True
++    assert table.columns["confidence"].nullable is True
++
++
++def test_class_risk_and_finding_context_schema() -> None:
++    class_risk = Base.metadata.tables["class_risk_prediction"]
++    assert class_risk.columns["confidence"].nullable is True
++    assert class_risk.columns["class_name"].nullable is False
++    assert {
++        foreign_key.target_fullname
++        for foreign_key in class_risk.columns["source_file_id"].foreign_keys
++    } == {"source_file.id"}
++    assert {
++        foreign_key.target_fullname
++        for foreign_key in class_risk.columns["model_version_id"].foreign_keys
++    } == {"ml_model_version.id"}
++
++    finding = Base.metadata.tables["finding"]
++    assert finding.columns["class_name"].nullable is True
++    assert finding.columns["method_name"].nullable is True
+ 
+ 
+ def test_business_keys_are_enforced_by_unique_constraints() -> None:
+@@ -134,7 +157,10 @@ def test_business_keys_are_enforced_by_unique_constraints() -> None:
+         "branch": {("repository_id", "name")},
+         "source_file": {("snapshot_id", "relative_path")},
+         "ml_model_version": {("model_type", "version_identifier")},
+-        "bug_risk_prediction": {("source_file_id", "model_version_id")},
++        "bug_risk_prediction": {("source_file_id", "model_version_id")},
++        "class_risk_prediction": {
++            ("source_file_id", "model_version_id", "class_name")
++        },
+     }
+ 
+     for table_name, required_keys in expected.items():
+diff --git a/apps/api/tests/unit/detection/test_risk_client.py b/apps/api/tests/unit/detection/test_risk_client.py
+index ba973c78..a0413d7d 100644
+--- a/apps/api/tests/unit/detection/test_risk_client.py
++++ b/apps/api/tests/unit/detection/test_risk_client.py
+@@ -77,7 +77,7 @@ def _mock_response(
+ 
+ 
+ def test_risk_client_predict_success():
+-    """Client sends class-level 21-feature observations and returns file risk."""
++    """Client sends class observations and preserves class and file risk."""
+     classes = [_class_metrics()]
+ 
+     process = {
+@@ -101,7 +101,10 @@ def test_risk_client_predict_success():
+         result = predict(classes, process)
+ 
+     assert isinstance(result, RiskClientResult)
+-    assert result.scores == {
++    assert result.class_scores == {
++        ("src/Main.java", "Main"): pytest.approx(0.78)
++    }
++    assert result.file_scores == {
+         "src/Main.java": pytest.approx(0.78)
+     }
+     assert result.model_version == "risk-2.0.0"
+@@ -155,7 +158,8 @@ def test_risk_client_empty_inputs():
+         result = predict([], {})
+ 
+     assert result == RiskClientResult(
+-        scores={},
++        class_scores={},
++        file_scores={},
+         model_version="",
+     )
+ 
+@@ -281,7 +285,8 @@ def test_risk_client_ignores_process_only_paths():
+         result = predict([], process)
+ 
+     assert result == RiskClientResult(
+-        scores={},
++        class_scores={},
++        file_scores={},
+         model_version="",
+     )
+ 
+@@ -380,7 +385,7 @@ def test_risk_client_broadcasts_file_process_metrics_to_classes():
+ 
+ 
+ def test_risk_client_aggregates_class_probabilities_by_file():
+-    """Class probabilities are aggregated only after class-level inference."""
++    """Class probabilities are preserved and aggregated by source file."""
+     classes = [
+         _class_metrics(
+             path="src/Example.java",
+@@ -418,7 +423,11 @@ def test_risk_client_aggregates_class_probabilities_by_file():
+     # 1 - (1 - 0.6)(1 - 0.3)
+     # = 1 - 0.28
+     # = 0.72
+-    assert result.scores["src/Example.java"] == pytest.approx(
++    assert result.class_scores == {
++        ("src/Example.java", "Example"): pytest.approx(0.6),
++        ("src/Example.java", "Helper"): pytest.approx(0.3),
++    }
++    assert result.file_scores["src/Example.java"] == pytest.approx(
+         0.72
+     )
+ 
+@@ -448,7 +457,10 @@ def test_single_class_file_preserves_probability():
+     ):
+         result = predict(classes, {})
+ 
+-    assert result.scores == {
++    assert result.class_scores == {
++        ("src/A.java", "A"): pytest.approx(0.42)
++    }
++    assert result.file_scores == {
+         "src/A.java": pytest.approx(0.42)
+     }
+ 
+@@ -541,7 +553,10 @@ def test_risk_client_filters_non_class_ck_entities():
+     assert len(sent) == 1
+     assert sent[0]["class_name"] == "Main"
+ 
+-    assert result.scores["src/Main.java"] == pytest.approx(
++    assert result.class_scores == {
++        ("src/Main.java", "Main"): pytest.approx(0.5)
++    }
++    assert result.file_scores["src/Main.java"] == pytest.approx(
+         0.5
+     )
+ 
+diff --git a/apps/api/tests/unit/detection/test_rule_engine.py b/apps/api/tests/unit/detection/test_rule_engine.py
+index b61cca28..567dbbf8 100644
+--- a/apps/api/tests/unit/detection/test_rule_engine.py
++++ b/apps/api/tests/unit/detection/test_rule_engine.py
+@@ -59,6 +59,11 @@ def test_metric_and_security_rules_produce_traceable_findings(tmp_path: Path) ->
+     }]
+     assert all(item.line == 8 for item in method_findings)
+     assert all(item.symbol == "Example.work" for item in method_findings)
++    assert all(item.class_name == "Example" for item in method_findings)
++    assert all(item.method_name == "work" for item in method_findings)
++    unresolved = [item for item in findings if item not in method_findings]
++    assert all(item.class_name is None for item in unresolved)
++    assert all(item.method_name is None for item in unresolved)
+ 
+ 
+ def test_rules_do_not_emit_findings_below_thresholds(tmp_path: Path) -> None:
+diff --git a/apps/api/tests/unit/scoring/test_engine.py b/apps/api/tests/unit/scoring/test_engine.py
+index 5c7331db..9df6d552 100644
+--- a/apps/api/tests/unit/scoring/test_engine.py
++++ b/apps/api/tests/unit/scoring/test_engine.py
+@@ -1,5 +1,6 @@
+ import pytest
+-from codesage_api.scoring.engine import score,aggregate_subtree
++
++from codesage_api.scoring.engine import aggregate_subtree, score
+ from codesage_api.scoring.enums import Category, Severity, Source
+ from codesage_api.scoring.formula import (
+     finding_priority,
+@@ -33,6 +34,7 @@ def make_finding(
+     category: Category,
+     severity: Severity,
+     source: Source = Source.RULE,
++    risk_score: float = 0.0,
+ ) -> ScoringFinding:
+     return ScoringFinding(
+         fingerprint=fingerprint,
+@@ -40,6 +42,7 @@ def make_finding(
+         category=category,
+         severity=severity,
+         file=file,
++        risk_score=risk_score,
+     )
+ 
+ 
+@@ -452,4 +455,4 @@ def test_aggregate_subtree_ignores_unknown_files() -> None:
+     assert aggregate_subtree(
+         files=["unknown.py"],
+         result=result,
+-    ) == pytest.approx(0.0)
+\ No newline at end of file
++    ) == pytest.approx(0.0)
+diff --git a/apps/api/tests/unit/scoring/test_floor.py b/apps/api/tests/unit/scoring/test_floor.py
+index 05a60223..8ec65d1b 100644
+--- a/apps/api/tests/unit/scoring/test_floor.py
++++ b/apps/api/tests/unit/scoring/test_floor.py
+@@ -16,6 +16,7 @@ def make_scored_finding(
+         category=category,
+         severity=severity,
+         file=f"src/{fingerprint}.py",
++        risk_score=0.0,
+     )
+ 
+     return ScoredFinding(
+@@ -160,4 +161,4 @@ def test_input_list_and_objects_are_not_modified() -> None:
+ 
+     assert security_finding.pinned_by_floor is False
+     assert result[0].pinned_by_floor is True
+-    assert result[0] is not security_finding
+\ No newline at end of file
++    assert result[0] is not security_finding
+diff --git a/apps/api/tests/unit/scoring/test_formula.py b/apps/api/tests/unit/scoring/test_formula.py
+index 8dc0692b..7d4aa2f6 100644
+--- a/apps/api/tests/unit/scoring/test_formula.py
++++ b/apps/api/tests/unit/scoring/test_formula.py
+@@ -38,9 +38,9 @@ def test_churn_factor_is_bounded_1_to_2() -> None:
+ 
+ 
+ def test_risk_factor_is_bounded_1_to_2_5(balanced: Profile) -> None:
+-    assert formula.risk_factor(FileFacts("a.java", 0.0, 0, 1000), balanced) == 1.0
++    assert formula.risk_factor(0.0, balanced) == 1.0
+     trusting_model = Profile(weights=balanced.weights, s=0.0)  # ml_trust = 1.5
+-    assert formula.risk_factor(FileFacts("a.java", 1.0, 0, 1000), trusting_model) == 2.5
++    assert formula.risk_factor(1.0, trusting_model) == 2.5
+ 
+ 
+ def test_trust_slider_default_position_is_neutral(balanced: Profile) -> None:
+@@ -63,7 +63,9 @@ def test_security_bypasses_the_trust_slider() -> None:
+     Without this, the "trust the model" end would quietly halve every security
+     finding, since all security detection is deterministic.
+     """
+-    finding = ScoringFinding("fp", Source.RULE, Category.SECURITY, Severity.CRITICAL, "a.java")
++    finding = ScoringFinding(
++        "fp", Source.RULE, Category.SECURITY, Severity.CRITICAL, "a.java", 0.0
++    )
+     for s in (0.0, 0.5, 1.0):
+         p = Profile(weights={c: 1.0 for c in Category}, s=s)
+         assert formula.source_trust(finding, p) == 1.0
+@@ -80,12 +82,32 @@ def test_ml_boost_cannot_invert_the_severity_ranking() -> None:
+     hot = FileFacts("hot.java", risk_score=1.0, commits_90d=100, loc=1000)
+     cold = FileFacts("cold.java", risk_score=0.0, commits_90d=0, loc=1000)
+ 
+-    low = ScoringFinding("a", Source.RULE, Category.CODE_DESIGN, Severity.LOW, "hot.java")
+-    critical = ScoringFinding("b", Source.RULE, Category.CODE_DESIGN, Severity.CRITICAL, "cold.java")
++    low = ScoringFinding(
++        "a", Source.RULE, Category.CODE_DESIGN, Severity.LOW, "hot.java", 1.0
++    )
++    critical = ScoringFinding(
++        "b", Source.RULE, Category.CODE_DESIGN, Severity.CRITICAL, "cold.java", 0.0
++    )
+ 
+     assert formula.finding_priority(low, hot, p) < formula.finding_priority(critical, cold, p)
+ 
+ 
++def test_finding_priority_uses_contextual_not_file_risk(
++    balanced: Profile,
++) -> None:
++    facts = FileFacts("same.java", risk_score=0.9, commits_90d=0, loc=1000)
++    low_risk = ScoringFinding(
++        "low", Source.RULE, Category.CODE_DESIGN, Severity.MEDIUM, "same.java", 0.1
++    )
++    high_risk = ScoringFinding(
++        "high", Source.RULE, Category.CODE_DESIGN, Severity.MEDIUM, "same.java", 0.8
++    )
++
++    assert formula.finding_priority(high_risk, facts, balanced) > formula.finding_priority(
++        low_risk, facts, balanced
++    )
++
++
+ def test_weights_and_s_are_clamped() -> None:
+     """FR-20: clamping is a server-side rule, and it clamps rather than rejects."""
+     weights, s = formula.clamp_profile({Category.SECURITY: 99.0, Category.TEST: -5.0}, s=42.0)
+diff --git a/apps/api/tests/unit/services/test_dashboard.py b/apps/api/tests/unit/services/test_dashboard.py
+index a547b617..367dcf67 100644
+--- a/apps/api/tests/unit/services/test_dashboard.py
++++ b/apps/api/tests/unit/services/test_dashboard.py
+@@ -19,6 +19,8 @@ from codesage_api.db.enums import (
+ from codesage_api.db.models import (
+     AnalysisAttempt,
+     Branch,
++    BugRiskPrediction,
++    ClassRiskPrediction,
+     Finding,
+     ProcessMetric,
+     Snapshot,
+@@ -124,6 +126,7 @@ def _snapshot(
+         weighted_age_with_respect_to=4,
+     )
+     source_file.bug_risk_predictions = []
++    source_file.class_risk_predictions = []
+     source_file.source_locations = []
+     if with_finding:
+         location = SourceLocation(
+@@ -158,6 +161,91 @@ def _snapshot(
+     return snapshot
+ 
+ 
++def test_snapshot_scoring_resolves_class_risk_with_file_fallback() -> None:
++    snapshot = _snapshot(
++        scanned_at=datetime(2026, 9, 24, tzinfo=UTC),
++        commit_sha="a" * 40,
++        with_finding=True,
++    )
++    source_file = snapshot.source_files[0]
++    model_version_id = uuid.uuid4()
++    source_file.bug_risk_predictions = [
++        BugRiskPrediction(
++            source_file_id=source_file.id,
++            model_version_id=model_version_id,
++            risk_score=0.85,
++            confidence=None,
++        )
++    ]
++    source_file.class_risk_predictions = [
++        ClassRiskPrediction(
++            source_file_id=source_file.id,
++            model_version_id=model_version_id,
++            class_name="Foo",
++            risk_score=0.80,
++            confidence=None,
++        ),
++        ClassRiskPrediction(
++            source_file_id=source_file.id,
++            model_version_id=model_version_id,
++            class_name="Helper",
++            risk_score=0.25,
++            confidence=None,
++        ),
++    ]
++
++    contexts = (
++        ("foo-finding", "Foo", 0.80),
++        ("helper-finding", "Helper", 0.25),
++        ("file-finding", None, 0.85),
++        ("missing-finding", "MissingClass", 0.85),
++    )
++    source_file.source_locations = []
++    for line, (fingerprint, class_name, _expected) in enumerate(contexts, start=1):
++        location = SourceLocation(
++            id=uuid.uuid4(),
++            source_file_id=source_file.id,
++            code_symbol_id=None,
++            start_line=line,
++            end_line=line,
++            start_column=0,
++            end_column=0,
++        )
++        finding = Finding(
++            id=uuid.uuid4(),
++            source_location_id=location.id,
++            category_id="code-design",
++            rule_id="long-method",
++            satd_prediction_id=None,
++            source=FindingSource.RULE,
++            severity=DbSeverity.MEDIUM,
++            description="Finding",
++            evidence=None,
++            measured_value=None,
++            threshold=None,
++            confidence=None,
++            fingerprint=fingerprint,
++            class_name=class_name,
++            method_name=None,
++        )
++        finding.source_location = location
++        location.findings = [finding]
++        location.code_symbol = None
++        source_file.source_locations.append(location)
++
++    scored = dashboard._score_snapshot(snapshot, _profile())
++    risks = {
++        item.finding.fingerprint: item.finding.risk_score
++        for item in scored.result.findings
++    }
++
++    assert risks == {
++        fingerprint: pytest.approx(expected)
++        for fingerprint, _class_name, expected in contexts
++    }
++    assert scored.file_facts["src/A.java"].risk_score == pytest.approx(0.85)
++
++
+ def _ready_cache(snapshot: Snapshot, profile: Profile) -> SimpleNamespace:
+     scored = dashboard._score_snapshot(snapshot, profile)
+     return SimpleNamespace(
+diff --git a/apps/api/tests/unit/tasks/test_scan_pipeline.py b/apps/api/tests/unit/tasks/test_scan_pipeline.py
+index 03f0c106..dc8a4da1 100644
+--- a/apps/api/tests/unit/tasks/test_scan_pipeline.py
++++ b/apps/api/tests/unit/tasks/test_scan_pipeline.py
+@@ -14,14 +14,19 @@ from codesage_api.db.enums import (
+ )
+ from codesage_api.db.models import (
+     AnalysisAttempt,
++    BugRiskPrediction,
++    ClassRiskPrediction,
++    Finding,
+     MLModelVersion,
+     SATDPrediction,
+     SourceFile,
+ )
+ from codesage_api.db.repositories.attempts import WorkerScanInput
+ from codesage_api.detection.risk.client import RiskClientResult
++from codesage_api.detection.rules.engine import DetectedFinding
+ from codesage_api.detection.satd.client import SATDResult
+ from codesage_api.errors import MLServiceUnavailable
++from codesage_api.extractors.ck_metrics import FileMetrics
+ from codesage_api.extractors.comments import ExtractedComment
+ from codesage_api.extractors.pipeline import ExtractionResult
+ from codesage_api.scoring.enums import Category
+@@ -72,7 +77,8 @@ def test_finalize_records_trained_risk_provenance(
+             ),
+             [],
+             RiskClientResult(
+-                scores={"src/Main.java": 0.7},
++                class_scores={},
++                file_scores={"src/Main.java": 0.7},
+                 model_version="risk-2.0.0",
+             ),
+         ),
+@@ -91,6 +97,104 @@ def test_finalize_records_trained_risk_provenance(
+     )
+ 
+ 
++@patch("codesage_api.tasks.scan_pipeline.set_workspace_context")
++@patch("codesage_api.tasks.scan_pipeline.attempts.get_worker_attempt")
++@patch("codesage_api.tasks.scan_pipeline.session_scope")
++def test_finalize_persists_file_and_class_risk_and_finding_context(
++    session_scope: Mock,
++    get_attempt: Mock,
++    _set_workspace: Mock,
++) -> None:
++    attempt = AnalysisAttempt(
++        id=uuid.uuid4(),
++        branch_id=uuid.uuid4(),
++        analysis_engine_version_id=uuid.uuid4(),
++        commit_sha="a" * 40,
++        trigger_type=AnalysisTriggerType.MANUAL,
++        status=AnalysisStatus.RUNNING,
++        retry_count=0,
++    )
++    get_attempt.return_value = attempt
++    model_version = MLModelVersion(
++        id=uuid.uuid4(),
++        model_type=MLModelType.BUG_RISK,
++        version_identifier="risk-2.0.0",
++        training_date=SimpleNamespace(),
++        deployment_status=ModelDeploymentStatus.DEPLOYED,
++        evaluation_dataset_reference="D'Ambros/AEEEM",
++        evaluation_metrics={},
++    )
++    session = session_scope.return_value.__enter__.return_value
++    session.scalar.return_value = model_version
++    session.get.return_value = None
++    metrics = FileMetrics(
++        path="src/Foo.java",
++        loc=100,
++        cyclomatic_complexity=5,
++        max_nesting_depth=2,
++        method_count=3,
++        longest_method_lines=20,
++        cbo=1.0,
++        dit=1.0,
++        lcom=0.0,
++        rfc=4.0,
++        noc=0.0,
++    )
++    finding = DetectedFinding(
++        file_path="src/Foo.java",
++        line=12,
++        symbol="Foo.work",
++        rule_id="long-method",
++        category=Category.CODE_DESIGN,
++        severity=Severity.MEDIUM,
++        description="Long method",
++        evidence="long-method=90",
++        measured_value=90.0,
++        threshold=80.0,
++        fingerprint="fingerprint",
++        class_name="Foo",
++        method_name="work",
++    )
++
++    _finalize(
++        attempt.id,
++        uuid.uuid4(),
++        PipelineResults(
++            ExtractionResult(
++                static_metrics=[metrics],
++                class_metrics=[],
++                process_metrics=[],
++                comments=[],
++            ),
++            [finding],
++            RiskClientResult(
++                class_scores={
++                    ("src/Foo.java", "Foo"): 0.8,
++                    ("src/Foo.java", "Helper"): 0.25,
++                },
++                file_scores={"src/Foo.java": 0.85},
++                model_version="risk-2.0.0",
++            ),
++        ),
++    )
++
++    added = [call.args[0] for call in session.add.call_args_list]
++    file_prediction = next(
++        item for item in added if isinstance(item, BugRiskPrediction)
++    )
++    class_predictions = [
++        item for item in added if isinstance(item, ClassRiskPrediction)
++    ]
++    stored_finding = next(item for item in added if isinstance(item, Finding))
++
++    assert file_prediction.risk_score == 0.85
++    assert {
++        item.class_name: item.risk_score for item in class_predictions
++    } == {"Foo": 0.8, "Helper": 0.25}
++    assert stored_finding.class_name == "Foo"
++    assert stored_finding.method_name == "work"
++
++
+ @patch("codesage_api.tasks.scan_pipeline.set_workspace_context")
+ @patch("codesage_api.tasks.scan_pipeline.attempts.get_worker_attempt")
+ @patch("codesage_api.tasks.scan_pipeline.session_scope")
+@@ -210,7 +314,8 @@ def test_task_runs_clone_extract_detect_and_finalize_in_order(
+     extract.return_value = extracted
+     detect.return_value = []
+     risk_res = RiskClientResult(
+-        scores={"Main.java": 0.85},
++        class_scores={("Main.java", "Main"): 0.85},
++        file_scores={"Main.java": 0.85},
+         model_version="risk-2.0.0",
+     )
+     predict.return_value = risk_res

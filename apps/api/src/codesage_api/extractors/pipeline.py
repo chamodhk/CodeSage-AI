@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-
 
 from codesage_api.extractors.ck_metrics import (
     ClassMetrics,
@@ -11,7 +11,6 @@ from codesage_api.extractors.ck_metrics import (
     MethodMetrics,
     extract_ck_analysis,
 )
-
 from codesage_api.extractors.comments import (
     ExtractedComment,
     extract_comments_from_file,
@@ -43,11 +42,20 @@ def extract(
     repository_path: Path,
     commit_sha: str,
     committer_date: datetime,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> ExtractionResult:
     """Extract stored numeric facts plus transient SATD comment inputs."""
     ck_metrics = extract_ck_analysis(repository_path)
+    if progress_callback is not None:
+        progress_callback(37)
+
     process = extract_process_metrics(repository_path, commit_sha, committer_date)
+    if progress_callback is not None:
+        progress_callback(52)
+
     comments = _extract_repository_comments(repository_path)
+    if progress_callback is not None:
+        progress_callback(60)
 
     return ExtractionResult(
         static_metrics=ck_metrics.files,

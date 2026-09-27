@@ -46,6 +46,7 @@ export type Category =
  * scoring sums *open* priorities, so the filter needs something to filter on.
  */
 export type FindingStatus = "open" | "accepted" | "resolved" | "false-positive"
+export type FindingChangeStatus = "new" | "unchanged"
 
 // A is best, E is worst.
 export type Grade = "A" | "B" | "C" | "D" | "E"
@@ -110,6 +111,7 @@ export interface Finding {
   reason: string // one-line templated explanation of why this fired
 
   status: FindingStatus // read-only in v1; backend-set, defaults to "open"
+  change_status: FindingChangeStatus
 
   /** Derived on this request under the active profile; the list arrives sorted by it. */
   priority: number

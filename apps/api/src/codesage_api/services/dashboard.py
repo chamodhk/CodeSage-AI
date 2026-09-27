@@ -31,6 +31,7 @@ from codesage_api.scoring.engine import score
 from codesage_api.scoring.enums import Category, FindingStatus, Grade, Severity, Source
 from codesage_api.scoring.models import FileFacts, Profile, ScoringFinding, ScoringResult
 from codesage_api.services import profiles
+from codesage_api.services.finding_diff import diff_snapshots
 from codesage_api.tasks.app import celery_app
 
 
@@ -100,7 +101,17 @@ def calculate_snapshot_score(
     cached.grade = scored.result.grade
     cached.debt_score = sum(item.debt_score for item in scored.result.files)
     cached.kloc = sum(item.loc for item in scored.file_facts.values()) / 1000.0
-    cached.result_payload = _result_payload(scored)
+    completed = dashboard_repository.list_completed_snapshots(
+        session,
+        workspace_id,
+        hydrated.analysis_attempt.branch.repository_id,
+        hydrated.analysis_attempt.branch.name,
+    )
+    current_index = next(
+        (index for index, item in enumerate(completed) if item.id == hydrated.id), -1
+    )
+    previous = completed[current_index - 1] if current_index > 0 else None
+    cached.result_payload = _result_payload(scored, previous)
 
 
 def build_latest_health_hint(
@@ -214,8 +225,11 @@ def _score_snapshot(snapshot: Snapshot, profile: Profile) -> _ScoredSnapshot:
     return _ScoredSnapshot(snapshot, result, file_facts, findings_by_fingerprint)
 
 
-def _finding_outputs(scored: _ScoredSnapshot) -> list[FindingOut]:
+def _finding_outputs(
+    scored: _ScoredSnapshot, previous: Snapshot | None = None
+) -> list[FindingOut]:
     output: list[FindingOut] = []
+    trace = diff_snapshots(scored.snapshot, previous)
     for item in scored.result.findings:
         stored = scored.findings_by_fingerprint[item.finding.fingerprint]
         location = stored.source_location
@@ -231,6 +245,11 @@ def _finding_outputs(scored: _ScoredSnapshot) -> list[FindingOut]:
                 symbol=location.code_symbol.name if location.code_symbol else None,
                 reason=stored.description,
                 status=FindingStatus.OPEN,
+                change_status=(
+                    "unchanged"
+                    if item.finding.fingerprint in trace.unchanged
+                    else "new"
+                ),
                 priority=item.priority,
                 pinned_by_floor=item.pinned_by_floor,
                 rule_id=stored.rule_id,
@@ -318,9 +337,12 @@ def _model_version(snapshot: Snapshot) -> str | None:
     return ", ".join(sorted(versions)) or None
 
 
-def _result_payload(scored: _ScoredSnapshot) -> dict[str, object]:
+def _result_payload(
+    scored: _ScoredSnapshot, previous: Snapshot | None = None
+) -> dict[str, object]:
     """Serialize every profile-dependent dashboard value in the worker."""
-    findings = _finding_outputs(scored)
+    findings = _finding_outputs(scored, previous)
+    trace = diff_snapshots(scored.snapshot, previous)
     return {
         "health_score": scored.result.health_score,
         "grade": scored.result.grade,
@@ -329,6 +351,7 @@ def _result_payload(scored: _ScoredSnapshot) -> dict[str, object]:
         ),
         "model_version": _model_version(scored.snapshot),
         "findings": [item.model_dump(mode="json") for item in findings],
+        "resolved_finding_count": len(trace.resolved),
         "tree": [item.model_dump(mode="json") for item in _tree(scored)],
         "file_scores": [
             FileScoreOut(

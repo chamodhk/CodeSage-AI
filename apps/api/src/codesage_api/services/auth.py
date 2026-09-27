@@ -1,16 +1,17 @@
 """Sign-in, sessions and sign-out (FR-1, SEC-01, SEC-10, SEC-17).
 
-The session lives in the database. The browser gets a cookie holding nothing but
-a random id. Two things follow from that, and both are the point:
+The session lives in the database. The browser gets an opaque random token while
+the database stores only its SHA-256 digest. Two things follow from that:
 
-  * a script that steals the cookie has stolen a number, not a credential — it
-    cannot be replayed against Asgardeo or GitHub;
+  * a database reader cannot turn the session table into live browser sessions;
   * signing out works immediately, because we delete the row.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -162,7 +163,9 @@ def establish_session(db: DbSession, claims: IdentityClaims) -> UserSession:
 
     now = datetime.now(timezone.utc)
     settings = get_settings()
+    raw_token = secrets.token_urlsafe(32)
     session = UserSession(
+        token_hash=_token_hash(raw_token),
         user_id=user.id,
         workspace_id=workspace_id,
         created_at=now,
@@ -171,7 +174,12 @@ def establish_session(db: DbSession, claims: IdentityClaims) -> UserSession:
     )
     db.add(session)
     db.flush()
+    session.raw_token = raw_token  # type: ignore[attr-defined]
     return session
+
+
+def _token_hash(raw_token: str) -> bytes:
+    return hashlib.sha256(raw_token.encode("utf-8")).digest()
 
 
 def _provision_new_user(db: DbSession, claims: IdentityClaims) -> User:
@@ -372,12 +380,9 @@ def load_valid_session(db: DbSession, raw_cookie: str | None) -> UserSession | N
     """
     if not raw_cookie:
         return None
-    try:
-        session_id = uuid.UUID(raw_cookie)
-    except ValueError:
-        return None
-
-    session = db.get(UserSession, session_id)
+    session = db.scalar(
+        select(UserSession).where(UserSession.token_hash == _token_hash(raw_cookie))
+    )
     now = datetime.now(timezone.utc)
     if session is None:
         return None
@@ -409,13 +414,11 @@ def load_valid_session(db: DbSession, raw_cookie: str | None) -> UserSession | N
 
 
 def end_session(db: DbSession, raw_cookie: str | None) -> None:
-    """Delete the row. After this the cookie is a meaningless number"""
+    """Delete the row. After this the cookie is a meaningless random string."""
     if not raw_cookie:
         return
-    try:
-        session_id = uuid.UUID(raw_cookie)
-    except ValueError:
-        return
-    session = db.get(UserSession, session_id)
+    session = db.scalar(
+        select(UserSession).where(UserSession.token_hash == _token_hash(raw_cookie))
+    )
     if session is not None:
         db.delete(session)

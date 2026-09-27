@@ -1,0 +1,114 @@
+apps/api/src/codesage_api/extractors
+├── ck_metrics.py
+├── comments.py
+├── __init__.py
+├── pipeline.py
+└── process_metrics.py
+apps/api/src/codesage_api/detection
+├── fingerprint.py
+├── __init__.py
+├── pmd
+├── reasons.py
+├── risk
+│   ├── client.py
+│   └── __init__.py
+├── rules
+│   ├── engine.py
+│   ├── __init__.py
+│   ├── registry.py
+│   └── security_rules.py
+└── satd
+    ├── client.py
+    ├── __init__.py
+    ├── markers.yaml
+    └── severity_markers.py
+apps/api/src/codesage_api/tasks
+├── app.py
+├── cancel.py
+├── __init__.py
+├── progress.py
+├── repository_clone.py
+├── scan_pipeline.py
+└── score_cache.py
+apps/api/src/codesage_api/db/models
+├── analysis.py
+├── authorization.py
+├── finding.py
+├── __init__.py
+├── ml.py
+├── profile.py
+├── provenance.py
+├── repository.py
+├── rules.py
+├── score.py
+├── source.py
+└── tenancy.py
+apps/ml/src/codesage_ml
+├── __init__.py
+├── main.py
+├── registry.py
+├── risk
+│   ├── features.py
+│   ├── __init__.py
+│   └── model.py
+├── satd
+│   ├── __init__.py
+│   └── labels.py
+└── schemas.py
+apps/api/tests/unit
+├── db
+│   ├── __init__.py
+│   ├── test_attempts_repository.py
+│   └── test_models.py
+├── detection
+│   ├── __init__.py
+│   ├── test_risk_client.py
+│   ├── test_rule_engine.py
+│   ├── test_satd_client.py
+│   └── test_security_rules.py
+├── extractors
+│   ├── __init__.py
+│   ├── test_ck_metrics.py
+│   ├── test_comments_pipeline.py
+│   └── test_process_metrics.py
+├── __init__.py
+├── integrations
+│   └── test_resend.py
+├── routers
+│   ├── __init__.py
+│   ├── test_auth_callback.py
+│   ├── test_auth_logout.py
+│   ├── test_auth_session.py
+│   ├── test_profiles.py
+│   ├── test_projects.py
+│   └── test_scans.py
+├── schemas
+│   ├── __init__.py
+│   └── test_contract.py
+├── scoring
+│   ├── __init__.py
+│   ├── test_cache.py
+│   ├── test_engine.py
+│   ├── test_floor.py
+│   └── test_formula.py
+├── services
+│   ├── __init__.py
+│   ├── test_analysis.py
+│   ├── test_auth_provisioning.py
+│   ├── test_dashboard.py
+│   ├── test_profiles.py
+│   └── test_repositories.py
+└── tasks
+    ├── __init__.py
+    ├── test_progress.py
+    ├── test_repository_clone.py
+    ├── test_scan_pipeline.py
+    └── test_score_cache.py
+apps/ml/tests
+├── __init__.py
+├── test_main.py
+├── test_prepare_aeeem.py
+├── test_registry.py
+└── test_risk_training.py
+
+22 directories, 90 files

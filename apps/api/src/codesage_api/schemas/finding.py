@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from codesage_api.schemas.base import ApiModel
 from codesage_api.scoring.enums import Category, FindingStatus, Severity, Source
 
@@ -27,6 +29,7 @@ class FindingOut(ApiModel):
     symbol: str | None
     reason: str
     status: FindingStatus
+    change_status: Literal["new", "unchanged"] = "new"
 
     priority: float
 

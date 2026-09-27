@@ -137,7 +137,7 @@ def complete_sign_in(code: str, state: str, request: Request) -> RedirectRespons
     db = SessionLocal()
     try:
         session = auth_service.establish_session(db, claims)
-        session_id = str(session.id)
+        session_token = session.raw_token
         db.commit()
     except Exception:
         db.rollback()
@@ -153,7 +153,7 @@ def complete_sign_in(code: str, state: str, request: Request) -> RedirectRespons
     )
     response.set_cookie(
         key=settings.session_cookie_name,
-        value=session_id,  # a random id, never a token
+        value=session_token,
         httponly=True,  # JavaScript cannot read it, so XSS cannot steal it
         secure=settings.cookie_secure,
         samesite="lax",  # another website cannot make the browser send it

@@ -44,6 +44,7 @@ from codesage_api.db.models import (
 from codesage_api.db.repositories import attempts, rules
 from codesage_api.db.rls import set_workspace_context
 from codesage_api.db.session import session_scope
+from codesage_api.detection import pmd
 from codesage_api.detection.fingerprint import (
     satd_fingerprint,
     unique_in_file_order,
@@ -115,6 +116,7 @@ def run_scan(self, attempt_id: str, workspace_id: str) -> None:
                 cloned.path,
                 cloned.commit_sha,
                 cloned.committer_date,
+                progress_callback=lambda percent: progress.publish_progress(attempt_id, percent),
             )
             progress.publish_progress(attempt_id, 60)
             cancel.check(attempt_id)
@@ -135,13 +137,30 @@ def run_scan(self, attempt_id: str, workspace_id: str) -> None:
                 extracted.method_metrics,
             )
 
+            pmd_result = pmd.scan(
+                cloned.path,
+                pmd.ScanContext(attempt_id=attempt_id),
+            )
+            findings.extend(pmd_result.findings)
+            pmd_log = (
+                logger.warning if pmd_result.status is pmd.DetectorStatus.DEGRADED else logger.info
+            )
+            pmd_log(
+                "PMD detector stage completed",
+                extra={
+                    **pmd_result.metadata,
+                    "status": pmd_result.status.value,
+                    "diagnostics": [
+                        {"code": item.code, "message": item.message}
+                        for item in pmd_result.diagnostics
+                    ],
+                },
+            )
+
             # ML-2 Risk Model prediction with graceful degradation
             risk_result: RiskClientResult | None = None
             try:
-                process_by_path = {
-                    p.path: p
-                    for p in extracted.process_metrics
-                }
+                process_by_path = {p.path: p for p in extracted.process_metrics}
 
                 risk_result = risk_client.predict(
                     extracted.class_metrics,
@@ -234,10 +253,7 @@ def _finalize(
         model_version_record: MLModelVersion | None = None
         if (
             results.risk_result
-            and (
-                results.risk_result.class_scores
-                or results.risk_result.file_scores
-            )
+            and (results.risk_result.class_scores or results.risk_result.file_scores)
             and results.risk_result.model_version
         ):
             v_name = results.risk_result.model_version
@@ -276,10 +292,7 @@ def _finalize(
                     )
                 )
 
-
-        process_by_path = {
-            item.path: item for item in results.extraction.process_metrics
-        }
+        process_by_path = {item.path: item for item in results.extraction.process_metrics}
 
         files_by_path: dict[str, SourceFile] = {}
         for metrics in results.extraction.static_metrics:
@@ -313,12 +326,8 @@ def _finalize(
                     ProcessMetric(
                         source_file=source_file,
                         commits_90d=process_metrics.commits_90d,
-                        number_of_versions_until=(
-                            process_metrics.number_of_versions_until
-                        ),
-                        number_of_authors_until=(
-                            process_metrics.number_of_authors_until
-                        ),
+                        number_of_versions_until=(process_metrics.number_of_versions_until),
+                        number_of_authors_until=(process_metrics.number_of_authors_until),
                         lines_added_until=process_metrics.lines_added_until,
                         max_lines_added_until=process_metrics.max_lines_added_until,
                         avg_lines_added_until=process_metrics.avg_lines_added_until,
@@ -329,9 +338,7 @@ def _finalize(
                         max_code_churn_until=process_metrics.max_code_churn_until,
                         avg_code_churn_until=process_metrics.avg_code_churn_until,
                         age_with_respect_to=process_metrics.age_with_respect_to,
-                        weighted_age_with_respect_to=(
-                            process_metrics.weighted_age_with_respect_to
-                        ),
+                        weighted_age_with_respect_to=(process_metrics.weighted_age_with_respect_to),
                     )
                 )
 
@@ -355,14 +362,11 @@ def _finalize(
                 )
 
         if results.risk_result and model_version_record:
-            for (file_path, class_name), score in sorted(
-                results.risk_result.class_scores.items()
-            ):
+            for (file_path, class_name), score in sorted(results.risk_result.class_scores.items()):
                 predicted_source_file = files_by_path.get(file_path)
                 if predicted_source_file is None:
                     raise RuntimeError(
-                        "A class risk prediction references "
-                        f"an unknown source file: {file_path}"
+                        f"A class risk prediction references an unknown source file: {file_path}"
                     )
                 session.add(
                     ClassRiskPrediction(
@@ -390,6 +394,18 @@ def _finalize(
                 session.flush()
                 files_by_path[path] = source_file
 
+        # Detectors may report a valid Java file that CK could not parse.
+        for detected in results.findings:
+            if detected.file_path not in files_by_path:
+                source_file = SourceFile(
+                    snapshot=snapshot,
+                    relative_path=detected.file_path,
+                    language="java",
+                )
+                session.add(source_file)
+                session.flush()
+                files_by_path[detected.file_path] = source_file
+
         for detected in results.findings:
             finding_file = files_by_path.get(detected.file_path)
             if finding_file is None:
@@ -398,9 +414,9 @@ def _finalize(
                 source_file=finding_file,
                 code_symbol=None,
                 start_line=detected.line,
-                end_line=detected.line,
-                start_column=0,
-                end_column=0,
+                end_line=detected.end_line or detected.line,
+                start_column=detected.begin_column,
+                end_column=detected.end_column,
             )
             session.add(location)
             session.flush()
@@ -436,9 +452,7 @@ def _finalize(
                 for result in results.satd_predictions
             ]
         )
-        for result, fingerprint in zip(
-            results.satd_predictions, satd_fingerprints, strict=True
-        ):
+        for result, fingerprint in zip(results.satd_predictions, satd_fingerprints, strict=True):
             if result.category is None:
                 raise RuntimeError("A debt prediction is missing its category.")
             finding_file = files_by_path.get(result.comment.file_path)

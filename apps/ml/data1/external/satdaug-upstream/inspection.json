@@ -1,0 +1,26 @@
+{
+  "rows": 68514,
+  "complete_rows": 68512,
+  "projects": 10,
+  "status_counts": {
+    "ori": 61803,
+    "augmention": 1514,
+    "augmentation": 5197
+  },
+  "class_counts": {
+    "code/design_debt": 2703,
+    "requirement_debt": 2271,
+    "test_debt": 2635,
+    "documentation_debt": 2701,
+    "non_debt": 58204
+  },
+  "original_class_counts": {
+    "code/design_debt": 2703,
+    "requirement_debt": 757,
+    "test_debt": 85,
+    "documentation_debt": 54,
+    "non_debt": 58204
+  },
+  "distinct_exact_texts_in_multiple_projects": 150,
+  "distinct_exact_texts_with_multiple_labels": 5
+}
